@@ -21,8 +21,8 @@ class Listwise_CE_Loss(nn.Module):
         margin = neg_pred - pos_pred
         exp_margin = torch.exp(margin - torch.max(margin)).detach_()
         
-        user_ids = einops.repeat(batch['user_id'], 'b -> (b copy)', copy=self.num_pos)         # [batch_size*num_pos]
-        pos_item_ids = einops.rearrange(batch['item_id'][:, :self.num_pos], 'b n -> (b n)')    # [batch_size*num_pos]
+        user_ids = einops.repeat(batch['user_id'], 'b -> (b copy)', copy=self.num_pos).cpu()         # [batch_size*num_pos]
+        pos_item_ids = einops.rearrange(batch['item_id'][:, :self.num_pos], 'b n -> (b n)').cpu()    # [batch_size*num_pos]
 
         self.u[user_ids, pos_item_ids] = (1-self.gamma0) * self.u[user_ids, pos_item_ids] + self.gamma0 * torch.mean(exp_margin, dim=1).cpu()
 
@@ -83,7 +83,9 @@ class NDCG_Loss(nn.Module):
         G = (2.0 ** ratings - 1).float()
 
         user_ids = batch['user_id']
+        user_ids = user_ids.cpu()
         pos_item_ids = batch['item_id'][:, :self.num_pos]  # [batch_size, num_pos]
+        pos_item_ids = pos_item_ids.cpu()
 
         pos_item_ids = einops.rearrange(pos_item_ids, 'b n -> (b n)')
         user_ids_repeat = einops.repeat(user_ids, 'n -> (n copy)', copy=self.num_pos)

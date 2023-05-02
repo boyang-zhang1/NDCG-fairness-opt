@@ -133,7 +133,7 @@ class BaseModel(nn.Module):
             self.topk = self.model.ndcg_topk
             self.reorg_train_data = self.model.reorg_train_data
 
-            if self.phase == 'train' or self.reorg_train_data:
+            if self.phase == 'train' and self.reorg_train_data:
                 self.raw_data = corpus.data_df[phase]
                 self.raw_data = self.raw_data[['user_id', 'item_id', 'rating']]
                 self.raw_data = self.raw_data.groupby('user_id', as_index=False).agg({'item_id':lambda x: list(x), 'rating':lambda x: list(x)})
