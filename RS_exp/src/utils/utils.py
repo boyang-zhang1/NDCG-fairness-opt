@@ -90,6 +90,8 @@ def check_dir(file_name: str) -> NoReturn:
 def non_increasing(lst: list) -> bool:
     return all(x >= y for x, y in zip(lst, lst[1:]))
 
+def non_decreasing(lst: list) -> bool:
+    return all(x <= y for x, y in zip(lst, lst[1:]))
 
 def get_time():
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")

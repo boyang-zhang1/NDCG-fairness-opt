@@ -20,12 +20,19 @@ class BaseReader(object):
                             help='Choose a dataset.')
         parser.add_argument('--sep', type=str, default='\t',
                             help='sep of csv file.')
+        parser.add_argument('--sensitive_types', type=str, default='Action,Crime',
+                            help='The sensitive types for attribute, sep by ",", e.g. Action,Crime for movies and F for gender.')
+        parser.add_argument('--attribute', type=str, default='users',
+                            help='users/movies has attributes(read users/movies.dat)')
+        
         return parser
 
     def __init__(self, args):
         self.sep = args.sep
         self.prefix = args.path
         self.dataset = args.dataset
+        self.sensitive_types = args.sensitive_types.split(',')
+        self.attribute =args.attribute
 
         self._read_data()
         self._append_his_info()
@@ -33,14 +40,53 @@ class BaseReader(object):
     def _read_data(self) -> NoReturn:
         logging.info('Reading data from \"{}\", dataset = \"{}\" '.format(self.prefix, self.dataset))
         self.data_df = dict()
+
+        self.data_df['attribute'] = pd.read_csv(os.path.join(self.prefix, self.dataset, self.attribute + '.dat'), sep=self.sep, encoding='latin-1')
+        self.data_df['attribute']['sensitive'] = False
+        if self.attribute == 'movies':
+            for i in range(len(self.data_df['attribute']['genres'])):
+                self.data_df['attribute']['genres'][i] = self.data_df['attribute']['genres'][i].split('|')
+                for genre in self.data_df['attribute']['genres'][i]:
+                    if genre in self.sensitive_types:
+                        self.data_df['attribute'].loc[i, 'sensitive'] = True
+        elif self.attribute == 'users':
+            for i in range(len(self.data_df['attribute']['gender'])):
+                if self.data_df['attribute']['gender'][i] == self.sensitive_types[0]:
+                    self.data_df['attribute']['sensitive'][i] = True
+                    
+        elif self.attribute == 'age':
+            for i in range(len(self.data_df['attribute']['age'])):
+                if str(self.data_df['attribute']['age'][i]) in self.sensitive_types:
+                    self.data_df['attribute'].loc[i, 'sensitive'] = True
+
+        elif self.attribute == 'occupation':
+            for i in range(len(self.data_df['attribute']['occupation'])):
+                if str(self.data_df['attribute']['occupation'][i]) in self.sensitive_types:
+                    self.data_df['attribute'].loc[i, 'sensitive'] = True
+
+        elif self.attribute == 'books':
+            for i in range(len(self.data_df['attribute']['genres'])):
+                if self.data_df['attribute']['genres'][i] == self.sensitive_types[0]:
+                    self.data_df['attribute'].loc[i, 'sensitive'] = True
+
+        elif self.attribute == 'movies_year':
+            for i in range(len(self.data_df['attribute']['year'])):
+                if int(self.data_df['attribute']['year'][i]) < int(self.sensitive_types[0]):
+                    self.data_df['attribute'].loc[i, 'sensitive'] = True
+        print("Load attribute finish")
+
         for key in ['train', 'dev', 'test']:
             self.data_df[key] = pd.read_csv(os.path.join(self.prefix, self.dataset, key + '.csv'), sep=self.sep)
             self.data_df[key] = utils.eval_list_columns(self.data_df[key])
+        print("Read csv finish")
 
         logging.info('Counting dataset statistics...')
+
         self.dev_test_df = pd.concat([df[['user_id','item_id']] for df in [self.data_df['dev'], self.data_df['test']]])
+
         self.n_users = max(self.data_df['train']['user_id'].max(), self.dev_test_df['user_id'].max()) + 1
-        self.n_items = max(self.data_df['train']['item_id'].max(), self.dev_test_df['item_id'].apply(max).max()) + 1
+        
+        self.n_items = max(self.data_df['train']['item_id'].max(), self.dev_test_df['item_id'].apply(max).max(), np.array(self.data_df['dev']['neg_items'].tolist()).max(), np.array(self.data_df['test']['neg_items'].tolist()).max()) + 1
         self.n_entry = len(self.data_df['train']) + \
                         (self.n_users-1) * self.data_df['dev']['item_id'].apply(lambda x: len(x)).max() + \
                         (self.n_users-1) * self.data_df['test']['item_id'].apply(lambda x: len(x)).max()
@@ -49,6 +95,7 @@ class BaseReader(object):
             if 'neg_items' in self.data_df[key]:
                 neg_items = np.array(self.data_df[key]['neg_items'].tolist())
                 assert (neg_items >= self.n_items).sum() == 0  # assert negative items don't include unseen ones
+
         logging.info('"# user": {}, "# item": {}, "# entry": {}'.format(
             self.n_users - 1, self.n_items - 1, self.n_entry))
 

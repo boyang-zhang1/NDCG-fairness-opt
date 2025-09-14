@@ -9,7 +9,7 @@ import argparse
 import numpy as np
 import torch
 import time
-
+import pandas as pd
 from helpers import *
 from models.general import *
 from models.sequential import *
@@ -64,11 +64,12 @@ def main():
     corpus_path = os.path.join(args.path, args.dataset, model_name.reader + '.pkl')
     if not args.regenerate and os.path.exists(corpus_path):
         logging.info('Load corpus from {}'.format(corpus_path))
-        corpus = pickle.load(open(corpus_path, 'rb'))
+        corpus = pd.read_pickle(corpus_path)
     else:
         corpus = reader_name(args)
         logging.info('Save corpus to {}'.format(corpus_path))
-        pickle.dump(corpus, open(corpus_path, 'wb'))
+        corpus.to_pickle(corpus_path)
+    attribute = corpus.data_df['attribute']
 
     # Define model
     model = model_name(args, corpus)
@@ -79,8 +80,10 @@ def main():
 
     # Run model
     data_dict = dict()
-    for phase in ['train', 'dev']:
-        data_dict[phase] = model_name.Dataset(model, corpus, phase)
+    # for phase in ['train', 'dev']:
+    #     data_dict[phase] = model_name.Dataset(model, corpus, phase)
+    data_dict['train'] = model_name.Dataset(model, corpus, 'train', attribute=attribute)
+    data_dict['dev'] = model_name.Dataset(model, corpus, 'dev')
     data_dict['test'] = model_name.Dataset(model, corpus, 'test', data_dict['train'], data_dict['dev'])
     runner = runner_name(args)
     # logging.info('Test Before Training: ' + runner.print_res(data_dict['test']))
@@ -91,8 +94,8 @@ def main():
             logging.info(os.linesep + 'Test After Loading: ' + runner.print_res(data_dict['test']))
             return
 
-        logging.info(os.linesep + 'Dev After Loading: ' + runner.print_res(data_dict['dev']))
-        logging.info(os.linesep + 'Test After Loading: ' + runner.print_res(data_dict['test']))
+        logging.info(os.linesep + 'Dev After Loading: ' + runner.print_res(data_dict['dev'], attribute))
+        logging.info(os.linesep + 'Test After Loading: ' + runner.print_res(data_dict['test'], attribute))
         if args.init_last > 0:
             logging.info('Reinitialize the last layer.')
             model.reset_last_layer()
@@ -100,8 +103,8 @@ def main():
             logging.info('Fix embedding layer.')
             model.fix_embedding_layer()
     if args.train > 0:
-        runner.train(data_dict)
-    logging.info(os.linesep + 'Test After Training: ' + runner.print_res(data_dict['test']))
+        runner.train(data_dict, attribute)
+    # logging.info(os.linesep + 'Test After Training: ' + runner.print_res(data_dict['test'], attribute))
 
     model.actions_after_train()
     logging.info(os.linesep + '-' * 45 + ' END: ' + utils.get_time() + ' ' + '-' * 45)
@@ -125,15 +128,19 @@ if __name__ == '__main__':
 
     # Logging configuration
     log_args = [init_args.model_name, args.dataset, str(args.random_seed), args.run_name]
-    for arg in ['lr', 'l2', 'batch_size','num_pos', 'num_neg', 'loss_type'] + model_name.extra_log_args:
+    for arg in ['ndcg_topk', 'fairness_c'] + model_name.extra_log_args:
         log_args.append(arg + '=' + str(eval('args.' + arg)))
     log_file_name = '__'.join(log_args).replace(' ', '__')
     current_time = time.asctime(time.localtime(time.time())).replace(' ', '-')
     log_file_name += '__' + current_time
     if args.log_file == '':
         args.log_file = '../log/{}/{}.txt'.format(init_args.model_name, log_file_name)
+    else:
+        args.log_file = os.path.join(args.log_file, '{}/{}.txt'.format(init_args.model_name, log_file_name))
     if args.model_path == '':
         args.model_path = '../model/{}/{}.pt'.format(init_args.model_name, log_file_name)
+    else:
+        args.model_path = os.path.join(args.model_path, '{}/{}.pt'.format(init_args.model_name, log_file_name))
 
     utils.check_dir(args.log_file)
     logging.basicConfig(filename=args.log_file, level=args.verbose)

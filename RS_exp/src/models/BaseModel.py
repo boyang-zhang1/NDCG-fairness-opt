@@ -1,6 +1,8 @@
 # -*- coding: UTF-8 -*-
 
 import time
+
+import pandas as pd
 import torch
 import logging
 import random
@@ -16,12 +18,24 @@ from utils import utils
 from helpers.BaseReader import BaseReader
 from . import losses, ndcg_loss
 
+# Global variable to store item attributes for fairness calculations
+ItemAttributes = {}
 
-def cal_ideal_dcg(x, topk=-1):
-    x_sorted = -np.sort(-np.array(x))  # descending order
-    pos = np.log2(1.0 + np.arange(1, len(x)+1))
-    ideal_dcg_size = topk if topk != -1 else len(x)
-    ideal_dcg = np.sum(((2 ** x_sorted - 1) / pos)[:ideal_dcg_size])
+def calculate_ideal_dcg(ratings, top_k=-1):
+    """
+    Calculate the Ideal Discounted Cumulative Gain (IDCG) for a list of ratings.
+
+    Args:
+        ratings (list): List of relevance ratings
+        top_k (int): Number of top items to consider. -1 means all items
+
+    Returns:
+        float: The ideal DCG value
+    """
+    ratings_sorted = -np.sort(-np.array(ratings))  # Sort in descending order
+    position_weights = np.log2(1.0 + np.arange(1, len(ratings) + 1))
+    dcg_size = top_k if top_k != -1 else len(ratings)
+    ideal_dcg = np.sum(((2 ** ratings_sorted - 1) / position_weights)[:dcg_size])
     return ideal_dcg
 
 
@@ -57,69 +71,142 @@ class BaseModel(nn.Module):
         self.buffer = args.buffer
         self.reorg_train_data = args.reorg_train_data
         self.optimizer = None
-        self.check_list = list()  # observe tensors in check_list every check_epoch
+        self.check_list = list()  # List of tensors to observe during training
 
         self._define_params()
         self.total_parameters = self.count_variables()
-        logging.info('#params: %d' % self.total_parameters)
+        logging.info(f'Model parameters: {self.total_parameters}')
 
     """
     Key Methods
     """
     def _define_params(self) -> NoReturn:
+        """
+        Define model parameters. To be implemented by subclasses.
+        """
         pass
 
     def forward(self, feed_dict: dict) -> dict:
         """
-        :param feed_dict: batch prepared in Dataset
-        :return: out_dict, including prediction with shape [batch_size, n_candidates]
+        Forward pass of the model.
+
+        Args:
+            feed_dict (dict): Batch data prepared in Dataset
+
+        Returns:
+            dict: Output dictionary including prediction with shape [batch_size, n_candidates]
         """
         pass
 
-    def loss(self, out_dict: dict) -> torch.Tensor:
+    def loss(self, out_dict: dict, attributes) -> torch.Tensor:
+        """
+        Calculate loss for the model.
+
+        Args:
+            out_dict (dict): Model output dictionary
+            attributes: Item attributes for loss calculation
+
+        Returns:
+            torch.Tensor: Computed loss value
+        """
         pass
 
     """
     Auxiliary Methods
     """
     def customize_parameters(self) -> list:
-        # customize optimizer settings for different parameters
-        weight_p, bias_p = [], []
-        for name, p in filter(lambda x: x[1].requires_grad, self.named_parameters()):
-            if 'bias' in name:
-                bias_p.append(p)
-            else:
-                weight_p.append(p)
-        optimize_dict = [{'params': weight_p}, {'params': bias_p, 'weight_decay': 0}]
-        return optimize_dict
+        """
+        Customize optimizer settings for different parameter groups.
+        Separates weight and bias parameters for different weight decay settings.
 
-    def save_model(self, model_path=None) -> NoReturn:
+        Returns:
+            list: List of parameter groups with custom settings
+        """
+        weight_params, bias_params = [], []
+        for name, param in filter(lambda x: x[1].requires_grad, self.named_parameters()):
+            if 'bias' in name:
+                bias_params.append(param)
+            else:
+                weight_params.append(param)
+
+        parameter_groups = [
+            {'params': weight_params},
+            {'params': bias_params, 'weight_decay': 0}
+        ]
+        return parameter_groups
+
+    def _model_path(self, model_path, model_tag) -> str:
         if model_path is None:
-            model_path = self.model_path
+            if model_tag is None:
+                model_path = self.model_path
+            else:
+                separator = '.'
+                path_split = self.model_path.split(separator)
+                model_path = separator.join(path_split[:-1]) + '_tag_' + str(model_tag) + separator + path_split[-1]
+        return model_path
+
+    def save_model(self, model_path=None, model_tag=None) -> NoReturn:
+        model_path = self._model_path(model_path, model_tag)
         utils.check_dir(model_path)
         torch.save(self.state_dict(), model_path)
 
-    def load_model(self, model_path=None) -> NoReturn:
-        if model_path is None:
-            model_path = self.model_path
-        self.load_state_dict(torch.load(model_path, map_location=self.device))
+    def load_model(self, model_path=None, model_tag=None) -> NoReturn:
+        model_path = self._model_path(model_path, model_tag)
+        state_dict = torch.load(model_path, map_location=self.device)
+        
+        # Handle size mismatch for item embeddings during model loading
+        if 'mlp_i_embeddings.weight' in state_dict:
+            pretrained_embeddings = state_dict['mlp_i_embeddings.weight']
+            current_embeddings = self.mlp_i_embeddings.weight.data
+
+            if pretrained_embeddings.size(0) != current_embeddings.size(0):
+                logging.warning(
+                    f"Size mismatch for mlp_i_embeddings.weight: "
+                    f"pretrained size {pretrained_embeddings.size()}, "
+                    f"current size {current_embeddings.size()}. "
+                    "Initializing additional embeddings randomly."
+                )
+
+                # Initialize additional embeddings with normal distribution
+                num_additional = current_embeddings.size(0) - pretrained_embeddings.size(0)
+                embedding_dim = pretrained_embeddings.size(1)
+                additional_embeddings = nn.init.normal_(
+                    torch.empty(num_additional, embedding_dim),
+                    mean=0.0, std=0.01
+                ).to(self.device)
+
+                pretrained_embeddings = torch.cat([pretrained_embeddings, additional_embeddings], dim=0)
+
+            state_dict['mlp_i_embeddings.weight'] = pretrained_embeddings
+
+        # Load the modified state dictionary
+        self.load_state_dict(state_dict, strict=False)
         logging.info('Load model from ' + model_path)
+
 
     def count_variables(self) -> int:
         total_parameters = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return total_parameters
 
-    def actions_before_train(self):  # e.g., re-initial some special parameters
+    def actions_before_train(self):
+        """
+        Actions to perform before training starts.
+        Can be used to re-initialize special parameters.
+        """
         pass
 
-    def actions_after_train(self):  # e.g., save selected parameters
+    def actions_after_train(self):
+        """
+        Actions to perform after training completes.
+        Can be used to save selected parameters or perform cleanup.
+        """
         pass
 
     """
     Define Dataset Class
     """
     class Dataset(BaseDataset):
-        def __init__(self, model, corpus, phase: str, train_set=None, dev_set=None):
+        def __init__(self, model, corpus, phase: str, train_set=None, dev_set=None, attribute=None):
             self.model = model  # model object reference
             self.corpus = corpus  # reader object reference
             self.phase = phase  # train / dev / test
@@ -134,24 +221,42 @@ class BaseModel(nn.Module):
             self.reorg_train_data = self.model.reorg_train_data
 
             if self.phase == 'train' and self.reorg_train_data:
+                global ItemAttributes
+                ItemAttributes = attribute
+
+                # Prepare and reorganize training data
                 self.raw_data = corpus.data_df[phase]
                 self.raw_data = self.raw_data[['user_id', 'item_id', 'rating']]
-                self.raw_data = self.raw_data.groupby('user_id', as_index=False).agg({'item_id':lambda x: list(x), 'rating':lambda x: list(x)})
-                self.raw_data['pos_items'] = self.raw_data['item_id'].apply(lambda x: len(x))
-                print("current topk:", self.topk)
-                self.raw_data['ideal_dcg'] = self.raw_data['rating'].apply(lambda x: cal_ideal_dcg(x, self.topk))
+                self.raw_data = self.raw_data.groupby('user_id', as_index=False).agg({
+                    'item_id': lambda x: list(x),
+                    'rating': lambda x: list(x)
+                })
+
+                # Calculate number of positive items per user
+                self.raw_data['pos_items'] = self.raw_data['item_id'].apply(len)
+
+                # Calculate ideal DCG for each user
+                logging.info(f"Computing IDCG with top-k: {self.topk}")
+                self.raw_data['ideal_dcg'] = self.raw_data['rating'].apply(
+                    lambda ratings: calculate_ideal_dcg(ratings, self.topk)
+                )
                 self.data = utils.df_to_dict(self.raw_data)
             else:
-                self.data = utils.df_to_dict(corpus.data_df[phase])
-                # ↑ DataFrame is not compatible with multi-thread operations
+                self.raw_data = corpus.data_df[phase]
+                self.data = utils.df_to_dict(self.raw_data)
+            # else:
+            #     self.data = utils.df_to_dict(corpus.data_df[phase])
+            #     # ↑ DataFrame is not compatible with multi-thread operations
 
             if self.phase == 'test':
                 self.max_train_pos_items = max(self.train_set.data['pos_items'])
                 self.dev_pos_items = len(self.dev_set.data['item_id'][0])
                 self.test_pos_items = len(self.data['item_id'][0])
-                print("train_max_pos_items:", self.max_train_pos_items)
-                print("dev_pos_items:", self.dev_pos_items)
-                print("test_pos_items:", self.test_pos_items)
+
+                logging.info(f"Dataset statistics:")
+                logging.info(f"  - Max training positive items: {self.max_train_pos_items}")
+                logging.info(f"  - Dev positive items: {self.dev_pos_items}")
+                logging.info(f"  - Test positive items: {self.test_pos_items}")
 
             self._prepare()
 
@@ -170,33 +275,65 @@ class BaseModel(nn.Module):
                 for i in tqdm(range(len(self)), leave=False, desc=('Prepare ' + self.phase)):
                     self.buffer_dict[i] = self._get_feed_dict(i)
 
-        # ! Key method to construct input data for a single instance
         def _get_feed_dict(self, index: int) -> dict:
+            """
+            Key method to construct input data for a single instance.
+            Must be implemented by subclasses.
+
+            Args:
+                index (int): Index of the data instance
+
+            Returns:
+                dict: Feed dictionary for the instance
+            """
             pass
 
-        # Called before each training epoch
         def actions_before_epoch(self) -> NoReturn:
+            """
+            Actions to perform before each training epoch.
+            Can be used for data shuffling or other epoch-level preparations.
+            """
             pass
 
-        # Collate a batch according to the list of feed dicts
         def collate_batch(self, feed_dicts: List[dict]) -> dict:
-            feed_dict = dict()
+            """
+            Collate a batch of feed dictionaries into a single batch dictionary.
+            Handles variable-length sequences by padding.
+
+            Args:
+                feed_dicts (List[dict]): List of individual feed dictionaries
+
+            Returns:
+                dict: Batched feed dictionary with tensors
+            """
+            batch_dict = {}
+
             for key in feed_dicts[0]:
                 if isinstance(feed_dicts[0][key], np.ndarray):
-                    tmp_list = [len(d[key]) for d in feed_dicts]
-                    if any([tmp_list[0] != l for l in tmp_list]):
-                        stack_val = np.array([d[key] for d in feed_dicts], dtype=np.object)
+                    # Check if all arrays have the same length
+                    lengths = [len(feed_dict[key]) for feed_dict in feed_dicts]
+                    if any(length != lengths[0] for length in lengths):
+                        # Variable length - use object array
+                        stacked_values = np.array([feed_dict[key] for feed_dict in feed_dicts], dtype=object)
                     else:
-                        stack_val = np.array([d[key] for d in feed_dicts])
+                        # Fixed length - use regular array
+                        stacked_values = np.array([feed_dict[key] for feed_dict in feed_dicts])
                 else:
-                    stack_val = np.array([d[key] for d in feed_dicts])
-                if stack_val.dtype == np.object:  # inconsistent length (e.g., history)
-                    feed_dict[key] = pad_sequence([torch.from_numpy(x) for x in stack_val], batch_first=True)
+                    stacked_values = np.array([feed_dict[key] for feed_dict in feed_dicts])
+
+                # Convert to tensor, padding if necessary
+                if stacked_values.dtype == object:
+                    # Pad sequences for variable-length data
+                    batch_dict[key] = pad_sequence(
+                        [torch.from_numpy(x) for x in stacked_values],
+                        batch_first=True
+                    )
                 else:
-                    feed_dict[key] = torch.from_numpy(stack_val)
-            feed_dict['batch_size'] = len(feed_dicts)
-            feed_dict['phase'] = self.phase
-            return feed_dict
+                    batch_dict[key] = torch.from_numpy(stacked_values)
+
+            batch_dict['batch_size'] = len(feed_dicts)
+            batch_dict['phase'] = self.phase
+            return batch_dict
 
 
 class GeneralModel(BaseModel):
@@ -213,8 +350,14 @@ class GeneralModel(BaseModel):
         parser.add_argument('--loss_type', type=str, default='BPR',
                             choices=['RankNet', 'ListNet', 'ListMLE',
                                      'NeuralNDCG', 'ApproxNDCG', 'LambdaRank', 
-                                     'Listwise_CE', 'NDCG'],          # ours
+                                     'Listwise_CE', 'NDCG', 'Listnet_Fair', 'BPR_Fair', 'Listmle_Fair'],          # ours
                             help='The loss used during training.')
+        parser.add_argument('--psi_func', type=str, default='sigmoid',
+                            choices=['hinge', 'softmax', 'sigmoid'],         
+                            help='The psi_func used during training.')
+        parser.add_argument('--fair_psi_func', type=str, default='sigmoid',
+                            choices=['softmax', 'sigmoid'],          
+                            help='The fair_psi_func used during training.')
         parser.add_argument('--neuralndcg_temp', type=float, default=1.0,
                             help='Temp for NeuralNDCG')
         parser.add_argument('--warmup_gamma', type=float, default=0.1,
@@ -223,6 +366,31 @@ class GeneralModel(BaseModel):
                             help='Gamma for NDCG-M.')
         parser.add_argument('--ndcg_topk', type=int, default=-1,
                             help='Topk for NDCG@k optimization')
+        parser.add_argument('--fairness_c', type=float, default=0,
+                            help='C for NDCG fairness loss')
+        parser.add_argument('--balance_fair', action='store_true', default=True,
+                            help='use balance fair for loss function')
+        parser.add_argument('--e_mode', type=str, default='1',
+                            help='mode for exy, default is 1, "avg" for average')
+        parser.add_argument('--simple_fair', action='store_true', default=False,
+                            help='use the simple fair loss (for ksong)')
+        parser.add_argument('--tau_1', type=float, default=0.001,
+                            help='tau_1)')
+        parser.add_argument('--sigmoid_alpha', type=float, default=2.0,
+                            help='sigmoid_alpha')
+        parser.add_argument('--sigmoid_beta', type=float, default=2.0,
+                            help='sigmoid_beta')
+        parser.add_argument('--sigmoid_t', type=float, default=1.0,
+                            help='sigmoid_t')
+        parser.add_argument('--fair_type', type=str, default='exp_top1_fair',
+                            help='fair_type from exp_topk, exp_top1_fair, exp_top1_fair_topk')
+        parser.add_argument('--gamma2', type=float, default=0.5,
+                            help='gamma2')
+        parser.add_argument('--gamma3', type=float, default=0.5,
+                            help='gamma3')
+        parser.add_argument('--gamma4', type=float, default=0.5,
+                            help='gamma4')
+
         return BaseModel.parse_model_args(parser)
 
     def __init__(self, args, corpus):
@@ -237,39 +405,113 @@ class GeneralModel(BaseModel):
         self.warmup_gamma = args.warmup_gamma
         self.ndcg_gamma = args.ndcg_gamma
         self.ndcg_topk = args.ndcg_topk
+        self.fairness_c = args.fairness_c
+        self.e_mode = args.e_mode
         self.eps = 1e-10
+        self.balance_fair = args.balance_fair
+        self.simple_fair = args.simple_fair
+        self.tau_1 = args.tau_1
+        self.sigmoid_alpha = args.sigmoid_alpha
+        self.sigmoid_beta = args.sigmoid_beta
+        self.sigmoid_t = args.sigmoid_t
+        self.psi_func = args.psi_func
+        self.fair_psi_func = args.fair_psi_func
+        self.fair_type = args.fair_type
+        self.gamma2 = args.gamma2
+        self.gamma3 = args.gamma3
+        self.gamma4 = args.gamma4
         super().__init__(args, corpus)
         self._build_loss_instance()
 
     def _build_loss_instance(self):
         if self.loss_type == 'Listwise_CE':
-            self.warmup_loss = ndcg_loss.Listwise_CE_Loss(self.user_num, self.item_num, self.num_pos, self.warmup_gamma, self.eps)
+            self.warmup_loss = ndcg_loss.ListwiseCrossEntropyLoss(
+                self.user_num, self.item_num, self.num_pos, self.warmup_gamma, self.eps,
+                fairness_weight=self.fairness_c, expectation_mode=self.e_mode,
+                use_balanced_fairness=self.balance_fair
+            )
         elif self.loss_type == 'NDCG':
-            self.NDCG_loss = ndcg_loss.NDCG_Loss(self.user_num, self.item_num, self.num_pos, self.ndcg_gamma, k=self.ndcg_topk)
+            self.ndcg_loss = ndcg_loss.NDCGLoss(
+                self.user_num, self.item_num, self.num_pos, self.ndcg_gamma,
+                top_k=self.ndcg_topk, fairness_weight=self.fairness_c,
+                expectation_mode=self.e_mode, eps=self.eps,
+                use_balanced_fairness=self.balance_fair, use_simple_fairness=self.simple_fair,
+                threshold_tau1=self.tau_1, sigmoid_alpha=self.sigmoid_alpha,
+                sigmoid_beta=self.sigmoid_beta, sigmoid_temperature=self.sigmoid_t,
+                psi_function=self.psi_func, fair_psi_function=self.fair_psi_func,
+                fairness_type=self.fair_type, gamma2=self.gamma2, gamma3=self.gamma3,
+                gamma4=self.gamma4
+            )
+        elif self.loss_type == 'Listnet_Fair':
+            self.listnet_fair_loss = ndcg_loss.ListNetFairLoss(
+                self.num_pos, eps=self.eps, fairness_weight=self.fairness_c,
+                expectation_mode=self.e_mode, use_balanced_fairness=self.balance_fair
+            )
+        elif self.loss_type == 'BPR_Fair':
+            self.bpr_fair_loss = ndcg_loss.BPRFairLoss(
+                eps=self.eps, fairness_weight=self.fairness_c,
+                expectation_mode=self.e_mode, use_balanced_fairness=self.balance_fair
+            )
+        elif self.loss_type == 'Listmle_Fair':
+            self.listmle_fair_loss = ndcg_loss.ListMLEFairLoss(
+                self.num_pos, eps=self.eps, fairness_weight=self.fairness_c,
+                expectation_mode=self.e_mode, use_balanced_fairness=self.balance_fair
+            )
 
     def loss(self, out_dict: dict, epoch: int) -> torch.Tensor:
         """
-        has multiple postive and nagetive samples
+        Calculate loss with multiple positive and negative samples.
 
-        :param out_dict: contain prediction with [batch_size, -1], the first column for positive, the rest for negative
-        :return:
+        Args:
+            out_dict (dict): Output dictionary containing predictions with shape [batch_size, num_pos + num_neg]
+            epoch (int): Current training epoch
+
+        Returns:
+            torch.Tensor: Computed loss value
         """
-        predictions = out_dict['prediction']                                                                 # [batch_size, num_pos + num_neg]
+        predictions = out_dict['prediction']  # [batch_size, num_pos + num_neg]
         batch_size = predictions.size(0)
-        pos_preds_transformed = torch.cat(torch.chunk(predictions[:, :self.num_pos], batch_size, dim=0), dim=1).permute(1,0)  # [batch_size * num_pos, 1]
-        neg_preds_transformed = torch.repeat_interleave(predictions[:, self.num_pos:], self.num_pos, dim=0)                   # [batch_size * num_pos, num_neg]
-        preds_transformed = torch.cat([pos_preds_transformed, neg_preds_transformed], dim=1)     # [batch_size * num_pos, 1+num_neg]
-        pos_pred, neg_pred = preds_transformed[:, 0], preds_transformed[:, 1:]                   # [batch_size * num_pos], [batch_size * num_pos, num_neg]
-        ratings = out_dict['rating'] if len(out_dict['rating'].shape)==2 else out_dict['rating'][:, None]    # [batch_size, num_pos]
+
+        # Transform predictions for positive samples
+        pos_predictions = torch.cat(
+            torch.chunk(predictions[:, :self.num_pos], batch_size, dim=0), dim=1
+        ).permute(1, 0)  # [batch_size * num_pos, 1]
+
+        # Transform predictions for negative samples
+        neg_predictions = torch.stack(
+            [predictions[:, self.num_pos:]] * self.num_pos, dim=1
+        ).view(-1, predictions.size(1) - self.num_pos)  # [batch_size * num_pos, num_neg]
+
+        # Combine positive and negative predictions
+        combined_predictions = torch.cat(
+            [pos_predictions, neg_predictions], dim=1
+        )  # [batch_size * num_pos, 1 + num_neg]
+
+        pos_scores, neg_scores = combined_predictions[:, 0], combined_predictions[:, 1:]
+        # [batch_size * num_pos], [batch_size * num_pos, num_neg]
+
+        # Handle ratings dimension
+        ratings = out_dict['rating']
+        if len(ratings.shape) == 1:
+            ratings = ratings[:, None]  # [batch_size, num_pos]
         
+        # Calculate loss based on specified loss type
         if self.loss_type == 'RankNet':
-            loss = losses.bpr_loss(pos_pred, neg_pred)
+            loss = losses.bpr_loss(pos_scores, neg_scores)
         elif self.loss_type == 'Listwise_CE':
             loss = self.warmup_loss(predictions, out_dict)
         elif self.loss_type == 'NDCG':
-            loss = self.NDCG_loss(predictions, out_dict)
+            loss = self.ndcg_loss(predictions, out_dict, epoch)
+        elif self.loss_type == 'BPR_Fair':
+            loss = self.bpr_fair_loss(pos_scores, neg_scores, predictions, out_dict)
+        elif self.loss_type == 'Listmle_Fair':
+            loss = self.listmle_fair_loss(predictions, out_dict)
+        elif self.loss_type == 'Listnet_Fair':
+            loss = self.listnet_fair_loss(predictions, out_dict)
         elif self.loss_type == 'NeuralNDCG':
-            loss = losses.neural_sort_loss(predictions, ratings, self.device, temperature=self.neuralndcg_temp)
+            loss = losses.neural_sort_loss(
+                predictions, ratings, self.device, temperature=self.neuralndcg_temp
+            )
         elif self.loss_type == 'ApproxNDCG':
             loss = losses.approx_ndcg_loss(predictions, ratings, self.device)
         elif self.loss_type == 'ListNet':
@@ -279,7 +521,8 @@ class GeneralModel(BaseModel):
         elif self.loss_type == 'LambdaRank':
             loss = losses.lambda_loss(predictions, ratings, self.device, 'lambdaRank_scheme')
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Loss type '{self.loss_type}' is not implemented")
+
         return loss
 
     class Dataset(BaseModel.Dataset):
@@ -305,12 +548,18 @@ class GeneralModel(BaseModel):
                         rating = pos_ratings
                     else:
                         assert 0, "num_pos must be >= 1"
+                    fairness_attrs = self._generate_fairness_attributes(item_ids)
                     feed_dict = {
                         'user_id': user_id,
                         'item_id': item_ids,
                         'rating': rating,
                         'num_pos_items': num_pos_items,
-                        'ideal_dcg': ideal_dcg
+                        'ideal_dcg': ideal_dcg,
+                        'a_index': fairness_attrs['a_index'],
+                        'b_index': fairness_attrs['b_index'],
+                        'mask_ratio_a': fairness_attrs['mask_ratio_a'],
+                        'mask_ratio_b': fairness_attrs['mask_ratio_b'],
+                        'rho': fairness_attrs['rho']
                     }
                 else:
                     user_id = self.data['user_id'][index]
@@ -335,36 +584,106 @@ class GeneralModel(BaseModel):
                         item_ids = np.concatenate([pos_items, neg_items]).astype(int)
                     else:
                         assert 0, "num_pos must be >= 1"
+                    fairness_attrs = self._generate_fairness_attributes(item_ids)
                     feed_dict = {
                         'user_id': user_id,
                         'item_id': item_ids,
                         'rating': pos_ratings,
                         'num_pos_items': num_pos_items,
-                        'ideal_dcg': ideal_dcg
+                        'ideal_dcg': ideal_dcg,
+                        'a_index': fairness_attrs['a_index'],
+                        'b_index': fairness_attrs['b_index'],
+                        'mask_ratio_a': fairness_attrs['mask_ratio_a'],
+                        'mask_ratio_b': fairness_attrs['mask_ratio_b'],
+                        'rho': fairness_attrs['rho']
                     }
                 return feed_dict
             else:    # self.phase == 'dev' or 'test'
                 user_id, target_items, rating = self.data['user_id'][index], self.data['item_id'][index], self.data['rating'][index]
-                if self.model.test_all and self.phase=='test':
-                    neg_items = np.setdiff1d(np.arange(1, self.corpus.n_items), target_items)
-                    neg_items = np.setdiff1d(neg_items, self.train_set.data['item_id'][index])
-                    neg_items = np.setdiff1d(neg_items, self.dev_set.data['item_id'][index])
-                    neg_items = np.random.choice(neg_items, self.corpus.n_items-1, replace=True)
-                    # make all users have the same number of negative items
+                if self.model.test_all and self.phase == 'test':
+                    # For test_all mode, exclude items from train, dev, and test sets
+                    excluded_items = np.concatenate([
+                        target_items,
+                        self.train_set.data['item_id'][index],
+                        self.dev_set.data['item_id'][index]
+                    ])
+                    neg_items = np.setdiff1d(np.arange(1, self.corpus.n_items), excluded_items)
+                    # Sample with replacement to ensure consistent number of items across users
+                    neg_items = np.random.choice(neg_items, self.corpus.n_items - 1, replace=True)
                 else:
                     neg_items = self.data['neg_items'][index]
                 item_ids = np.concatenate([target_items, neg_items]).astype(int)
+                fairness_attrs = self._generate_fairness_attributes(item_ids)
                 feed_dict = {
                     'user_id': user_id,
                     'item_id': item_ids,
-                    'rating': rating
+                    'rating': rating,
+                    'a_index': fairness_attrs['a_index'],
+                    'b_index': fairness_attrs['b_index'],
+                    'mask_ratio_a': fairness_attrs['mask_ratio_a'],
+                    'mask_ratio_b': fairness_attrs['mask_ratio_b'],
+                    'rho': fairness_attrs['rho']
                 }
                 return feed_dict
 
-        # Sample positive and negative items for all the instances
-        # use this function ONLY before training
-        # NOW! we put positve and negative sampling into _get_feed_dict !!!
+        def _generate_fairness_attributes(self, item_ids):
+            """
+            Generate fairness-related attributes for a set of items.
+
+            Args:
+                item_ids (np.ndarray): Array of item IDs
+
+            Returns:
+                dict: Dictionary containing fairness attributes including rho, indices, and mask ratios
+            """
+            fairness_info = {
+                'rho': [],
+                'a_index': [],
+                'b_index': [],
+                'mask_ratio_a': [],
+                'mask_ratio_b': []
+            }
+
+            global ItemAttributes
+            num_items = len(item_ids)
+
+            # Create binary masks for sensitive attribute groups
+            group_a_mask = np.array([
+                1 if is_sensitive else 0
+                for is_sensitive in ItemAttributes['sensitive'][item_ids - 1]
+            ])
+            group_b_mask = np.where(group_a_mask == 1, 0, 1)
+
+            count_a = np.sum(group_a_mask)
+            count_b = np.sum(group_b_mask)
+
+            # Calculate rho (ratio of minority to majority group)
+            if count_a < count_b:
+                fairness_info['rho'] = count_a / count_b if count_b > 0 else 0.0
+            else:
+                fairness_info['rho'] = count_b / count_a if count_a > 0 else 0.0
+                # Swap groups so that group A is always the minority
+                group_a_mask, group_b_mask = group_b_mask, group_a_mask
+                count_a, count_b = count_b, count_a
+
+            # Calculate mask ratios (avoid division by zero)
+            fairness_info['mask_ratio_a'] = count_a / num_items if num_items > 0 else 0.0
+            fairness_info['mask_ratio_b'] = count_b / num_items if num_items > 0 else 0.0
+
+            # Ensure mask_ratio_a is not zero to avoid division by zero in loss calculations
+            if fairness_info['mask_ratio_a'] == 0:
+                fairness_info['mask_ratio_a'] = 1.0
+
+            fairness_info['a_index'] = group_a_mask
+            fairness_info['b_index'] = group_b_mask
+
+            return fairness_info
+
         def actions_before_epoch(self) -> NoReturn:
+            """
+            Actions to perform before each training epoch.
+            Note: Positive and negative sampling is now handled in _get_feed_dict method.
+            """
             pass
 
 
