@@ -25,12 +25,19 @@ def calculate_ideal_dcg(ratings, top_k=-1):
     """
     Calculate the Ideal Discounted Cumulative Gain (IDCG) for a list of ratings.
 
+    IDCG represents the maximum possible DCG that can be achieved by perfectly
+    ranking items according to their relevance scores. It serves as the normalization
+    factor for computing NDCG (Normalized DCG) metrics.
+
+    The calculation uses the standard DCG formula:
+    DCG = Σ (2^relevance - 1) / log2(position + 1)
+
     Args:
-        ratings (list): List of relevance ratings
-        top_k (int): Number of top items to consider. -1 means all items
+        ratings (list): List of relevance ratings/scores for items
+        top_k (int): Number of top positions to consider. -1 means all items
 
     Returns:
-        float: The ideal DCG value
+        float: The ideal DCG value for normalization
     """
     ratings_sorted = -np.sort(-np.array(ratings))  # Sort in descending order
     position_weights = np.log2(1.0 + np.arange(1, len(ratings) + 1))
@@ -41,12 +48,44 @@ def calculate_ideal_dcg(ratings, top_k=-1):
 
 
 class BaseModel(nn.Module):
+    """
+    Abstract base class for recommendation models with fairness considerations.
+
+    This class provides the foundational architecture for building recommendation
+    models that can be evaluated for both accuracy and fairness. It defines the
+    essential interface and common functionality that all recommendation models
+    should implement.
+
+    Key Features:
+    - Abstract model interface with forward pass and loss calculation
+    - Model parameter management and optimization setup
+    - Model saving/loading with dynamic embedding size handling
+    - Custom parameter grouping for differential optimization
+    - Integration with fairness-aware evaluation frameworks
+
+    Subclasses must implement:
+    - _define_params(): Model architecture definition
+    - forward(): Forward pass computation
+    - loss(): Loss function calculation
+    """
     reader = 'BaseReader'
     runner = 'BaseRunner'
     extra_log_args = []
 
     @staticmethod
     def parse_model_args(parser):
+        """
+        Parse command-line arguments for base model configuration.
+
+        Defines essential model parameters including paths, buffering options,
+        and data organization settings that are common across all model types.
+
+        Args:
+            parser: ArgumentParser instance to add model arguments to
+
+        Returns:
+            ArgumentParser: Updated parser with base model arguments
+        """
         parser.add_argument('--model_path', type=str, default='',
                             help='Model save path.')
         parser.add_argument('--buffer', type=int, default=1,
@@ -57,6 +96,16 @@ class BaseModel(nn.Module):
 
     @staticmethod
     def init_weights(m):
+        """
+        Initialize model weights using normal distribution.
+
+        Applies consistent weight initialization strategy across different layer types
+        to ensure stable training dynamics. Uses small standard deviation to prevent
+        gradient explosion while maintaining sufficient variance for learning.
+
+        Args:
+            m: PyTorch module to initialize
+        """
         if 'Linear' in str(type(m)):
             nn.init.normal_(m.weight, mean=0.0, std=0.01)
             if m.bias is not None:
@@ -65,6 +114,17 @@ class BaseModel(nn.Module):
             nn.init.normal_(m.weight, mean=0.0, std=0.01)
 
     def __init__(self, args, corpus: BaseReader):
+        """
+        Initialize the base model with configuration and dataset information.
+
+        Sets up device configuration, model paths, buffering options, and other
+        essential model parameters. Calls parameter definition and counts total
+        trainable parameters.
+
+        Args:
+            args: Configuration object with model parameters
+            corpus (BaseReader): Dataset reader containing corpus information
+        """
         super(BaseModel, self).__init__()
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.model_path = args.model_path
@@ -82,32 +142,49 @@ class BaseModel(nn.Module):
     """
     def _define_params(self) -> NoReturn:
         """
-        Define model parameters. To be implemented by subclasses.
+        Define model architecture and parameters.
+
+        This abstract method should be implemented by subclasses to define
+        the specific neural network architecture, including embedding layers,
+        hidden layers, and output layers appropriate for the recommendation task.
         """
         pass
 
     def forward(self, feed_dict: dict) -> dict:
         """
-        Forward pass of the model.
+        Perform forward pass to generate predictions.
+
+        This abstract method should implement the forward computation graph
+        that transforms input features into ranking scores for recommendation.
+        The output should include prediction scores for all candidate items.
 
         Args:
-            feed_dict (dict): Batch data prepared in Dataset
+            feed_dict (dict): Batch data prepared in Dataset containing:
+                            - user_id: User identifiers
+                            - item_id: Item identifiers
+                            - Other model-specific features
 
         Returns:
-            dict: Output dictionary including prediction with shape [batch_size, n_candidates]
+            dict: Output dictionary containing:
+                - prediction: Tensor of shape [batch_size, n_candidates] with ranking scores
+                - Other model-specific outputs
         """
         pass
 
     def loss(self, out_dict: dict, attributes) -> torch.Tensor:
         """
-        Calculate loss for the model.
+        Calculate the training loss combining accuracy and fairness objectives.
+
+        This abstract method should implement loss computation that may include
+        both recommendation accuracy (e.g., ranking loss, NDCG loss) and fairness
+        constraints. The loss should be differentiable for gradient-based optimization.
 
         Args:
-            out_dict (dict): Model output dictionary
-            attributes: Item attributes for loss calculation
+            out_dict (dict): Model output dictionary containing predictions and metadata
+            attributes: Item attributes for fairness-aware loss calculation
 
         Returns:
-            torch.Tensor: Computed loss value
+            torch.Tensor: Scalar loss value for backpropagation
         """
         pass
 
@@ -116,11 +193,16 @@ class BaseModel(nn.Module):
     """
     def customize_parameters(self) -> list:
         """
-        Customize optimizer settings for different parameter groups.
-        Separates weight and bias parameters for different weight decay settings.
+        Organize model parameters into groups with different optimization settings.
+
+        Separates weight and bias parameters to apply different regularization strategies.
+        Weight parameters typically use weight decay for regularization, while bias
+        parameters are often exempted from weight decay to prevent underfitting.
 
         Returns:
-            list: List of parameter groups with custom settings
+            list: List of parameter dictionaries for optimizer:
+                - weights: Parameters with normal weight decay
+                - biases: Parameters with zero weight decay
         """
         weight_params, bias_params = [], []
         for name, param in filter(lambda x: x[1].requires_grad, self.named_parameters()):
@@ -136,6 +218,19 @@ class BaseModel(nn.Module):
         return parameter_groups
 
     def _model_path(self, model_path, model_tag) -> str:
+        """
+        Generate model file path with optional tagging for different model variants.
+
+        Supports saving multiple model checkpoints with different tags (e.g., best,
+        epoch-specific, fairness-optimized) while maintaining organized file structure.
+
+        Args:
+            model_path: Base model path (if None, uses default)
+            model_tag: Optional tag to differentiate model variants
+
+        Returns:
+            str: Complete file path for model saving/loading
+        """
         if model_path is None:
             if model_tag is None:
                 model_path = self.model_path
@@ -146,11 +241,34 @@ class BaseModel(nn.Module):
         return model_path
 
     def save_model(self, model_path=None, model_tag=None) -> NoReturn:
+        """
+        Save model state dictionary to disk.
+
+        Persists the current model parameters to enable later restoration
+        for inference or continued training. Supports multiple model variants
+        through tagging system.
+
+        Args:
+            model_path: Custom save path (optional)
+            model_tag: Tag for model variant identification (optional)
+        """
         model_path = self._model_path(model_path, model_tag)
         utils.check_dir(model_path)
         torch.save(self.state_dict(), model_path)
 
     def load_model(self, model_path=None, model_tag=None) -> NoReturn:
+        """
+        Load model state dictionary from disk with dynamic embedding handling.
+
+        Restores model parameters from saved state while gracefully handling
+        scenarios where the current model has different embedding dimensions
+        (e.g., when new items are added to the dataset). Additional embeddings
+        are initialized randomly to maintain model functionality.
+
+        Args:
+            model_path: Custom load path (optional)
+            model_tag: Tag for model variant identification (optional)
+        """
         model_path = self._model_path(model_path, model_tag)
         state_dict = torch.load(model_path, map_location=self.device)
         
@@ -185,20 +303,35 @@ class BaseModel(nn.Module):
 
 
     def count_variables(self) -> int:
+        """
+        Count the total number of trainable parameters in the model.
+
+        Provides insight into model complexity and memory requirements.
+        Only counts parameters that require gradients (trainable parameters).
+
+        Returns:
+            int: Total number of trainable parameters
+        """
         total_parameters = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return total_parameters
 
     def actions_before_train(self):
         """
-        Actions to perform before training starts.
-        Can be used to re-initialize special parameters.
+        Execute pre-training setup actions.
+
+        Override this method to perform model-specific initialization,
+        parameter re-initialization, or other setup tasks required
+        before training begins.
         """
         pass
 
     def actions_after_train(self):
         """
-        Actions to perform after training completes.
-        Can be used to save selected parameters or perform cleanup.
+        Execute post-training cleanup and finalization actions.
+
+        Override this method to perform model-specific cleanup,
+        parameter saving, result logging, or other finalization
+        tasks after training completion.
         """
         pass
 
@@ -206,7 +339,37 @@ class BaseModel(nn.Module):
     Define Dataset Class
     """
     class Dataset(BaseDataset):
+        """
+        Dataset class for handling recommendation data with fairness attributes.
+
+        This class manages data loading, preprocessing, and batch preparation for
+        recommendation models. It supports different phases (train/dev/test) and
+        handles fairness-related attribute processing.
+
+        Key Features:
+        - Multi-phase data handling (train/dev/test)
+        - Fairness attribute computation and integration
+        - Flexible batch collation with padding support
+        - Data buffering for efficient evaluation
+        - IDCG calculation for NDCG-based training
+        """
+
         def __init__(self, model, corpus, phase: str, train_set=None, dev_set=None, attribute=None):
+            """
+            Initialize dataset with model configuration and data specifications.
+
+            Sets up data structures for the specified phase and prepares fairness
+            attributes if available. Handles data reorganization for training
+            efficiency and computes ideal DCG values when needed.
+
+            Args:
+                model: Reference to the model instance
+                corpus: Data reader containing the dataset
+                phase (str): Data phase - 'train', 'dev', or 'test'
+                train_set: Training dataset reference (for test phase)
+                dev_set: Development dataset reference (for test phase)
+                attribute: Item attribute information for fairness evaluation
+            """
             self.model = model  # model object reference
             self.corpus = corpus  # reader object reference
             self.phase = phase  # train / dev / test
@@ -271,40 +434,63 @@ class BaseModel(nn.Module):
 
         # Prepare model-specific variables and buffer feed dicts
         def _prepare(self) -> NoReturn:
+            """
+            Prepare dataset for efficient batch loading.
+
+            Pre-computes and buffers feed dictionaries for development and test phases
+            to accelerate evaluation. For training phase, data is generated on-the-fly
+            to support dynamic negative sampling.
+            """
             if self.buffer:
                 for i in tqdm(range(len(self)), leave=False, desc=('Prepare ' + self.phase)):
                     self.buffer_dict[i] = self._get_feed_dict(i)
 
         def _get_feed_dict(self, index: int) -> dict:
             """
-            Key method to construct input data for a single instance.
-            Must be implemented by subclasses.
+            Construct input data dictionary for a single instance.
+
+            This abstract method should be implemented by subclasses to define
+            how raw data is transformed into model-ready format. It should handle
+            user-item interactions, negative sampling, and feature preparation.
 
             Args:
-                index (int): Index of the data instance
+                index (int): Index of the data instance in the dataset
 
             Returns:
-                dict: Feed dictionary for the instance
+                dict: Feed dictionary containing:
+                    - user_id: User identifier
+                    - item_id: Item identifiers (positive + negative)
+                    - rating: Relevance ratings
+                    - Other model-specific features
             """
             pass
 
         def actions_before_epoch(self) -> NoReturn:
             """
-            Actions to perform before each training epoch.
-            Can be used for data shuffling or other epoch-level preparations.
+            Execute pre-epoch data preparation tasks.
+
+            Override this method to implement epoch-level data preparation
+            such as negative sampling strategy updates, data shuffling,
+            or dynamic data augmentation.
             """
             pass
 
         def collate_batch(self, feed_dicts: List[dict]) -> dict:
             """
-            Collate a batch of feed dictionaries into a single batch dictionary.
-            Handles variable-length sequences by padding.
+            Collate individual feed dictionaries into a batch tensor dictionary.
+
+            Handles the conversion from list of individual instances to batched tensors,
+            with automatic padding for variable-length sequences. Supports both fixed-size
+            and variable-size data arrays.
 
             Args:
-                feed_dicts (List[dict]): List of individual feed dictionaries
+                feed_dicts (List[dict]): List of individual feed dictionaries from __getitem__
 
             Returns:
-                dict: Batched feed dictionary with tensors
+                dict: Batched dictionary with PyTorch tensors:
+                    - All keys from input dicts converted to batch tensors
+                    - batch_size: Number of instances in the batch
+                    - phase: Current data phase (train/dev/test)
             """
             batch_dict = {}
 
@@ -337,8 +523,36 @@ class BaseModel(nn.Module):
 
 
 class GeneralModel(BaseModel):
+    """
+    General recommendation model with comprehensive loss function support.
+
+    This class extends BaseModel to provide a full-featured recommendation system
+    supporting multiple loss functions, fairness-aware training, and various
+    evaluation strategies. It serves as the base for most practical recommendation
+    model implementations.
+
+    Key Features:
+    - Multiple loss function support (BPR, NDCG, ListNet, etc.)
+    - Fairness-aware loss variants (BPR_Fair, NDCG_Fair, etc.)
+    - Configurable positive/negative sampling
+    - Advanced fairness attribute processing
+    - Support for both pointwise and listwise learning
+    """
+
     @staticmethod
     def parse_model_args(parser):
+        """
+        Parse command-line arguments for GeneralModel configuration.
+
+        Defines comprehensive model parameters including loss function selection,
+        sampling strategies, fairness settings, and various hyperparameters.
+
+        Args:
+            parser: ArgumentParser instance
+
+        Returns:
+            ArgumentParser: Updated parser with GeneralModel arguments
+        """
         parser.add_argument('--num_neg', type=int, default=1,
                             help='The number of negative items during training.')
         parser.add_argument('--num_pos', type=int, default=1,
@@ -394,6 +608,17 @@ class GeneralModel(BaseModel):
         return BaseModel.parse_model_args(parser)
 
     def __init__(self, args, corpus):
+        """
+        Initialize GeneralModel with comprehensive parameter configuration.
+
+        Sets up all model parameters including loss function configuration,
+        fairness settings, sampling parameters, and other hyperparameters
+        required for training and evaluation.
+
+        Args:
+            args: Configuration object with model hyperparameters
+            corpus: Dataset corpus containing user-item interactions
+        """
         self.user_num = corpus.n_users
         self.item_num = corpus.n_items
         self.num_neg = args.num_neg
@@ -424,6 +649,13 @@ class GeneralModel(BaseModel):
         self._build_loss_instance()
 
     def _build_loss_instance(self):
+        """
+        Initialize loss function instances based on specified loss type.
+
+        Creates and configures the appropriate loss function object with all
+        necessary parameters including fairness weights, temperature settings,
+        and other hyperparameters specific to each loss type.
+        """
         if self.loss_type == 'Listwise_CE':
             self.warmup_loss = ndcg_loss.ListwiseCrossEntropyLoss(
                 self.user_num, self.item_num, self.num_pos, self.warmup_gamma, self.eps,
@@ -460,14 +692,21 @@ class GeneralModel(BaseModel):
 
     def loss(self, out_dict: dict, epoch: int) -> torch.Tensor:
         """
-        Calculate loss with multiple positive and negative samples.
+        Calculate training loss with support for multiple loss functions and fairness.
+
+        Supports various loss functions including traditional ranking losses (BPR, ListNet)
+        and fairness-aware variants that incorporate demographic parity constraints.
+        The loss computation handles multiple positive and negative samples per user.
 
         Args:
-            out_dict (dict): Output dictionary containing predictions with shape [batch_size, num_pos + num_neg]
-            epoch (int): Current training epoch
+            out_dict (dict): Output dictionary containing:
+                           - prediction: Tensor of shape [batch_size, num_pos + num_neg]
+                           - rating: Relevance ratings
+                           - Fairness-related attributes (a_index, b_index, etc.)
+            epoch (int): Current training epoch (used for dynamic loss weighting)
 
         Returns:
-            torch.Tensor: Computed loss value
+            torch.Tensor: Computed scalar loss value for backpropagation
         """
         predictions = out_dict['prediction']  # [batch_size, num_pos + num_neg]
         batch_size = predictions.size(0)
@@ -628,13 +867,22 @@ class GeneralModel(BaseModel):
 
         def _generate_fairness_attributes(self, item_ids):
             """
-            Generate fairness-related attributes for a set of items.
+            Generate comprehensive fairness attributes for demographic parity evaluation.
+
+            Computes various fairness-related statistics and indices required for
+            fairness-aware loss functions. This includes group memberships, ratios,
+            and demographic parity metrics.
 
             Args:
-                item_ids (np.ndarray): Array of item IDs
+                item_ids (np.ndarray): Array of item IDs to process
 
             Returns:
-                dict: Dictionary containing fairness attributes including rho, indices, and mask ratios
+                dict: Dictionary containing fairness attributes:
+                    - rho: Ratio of minority to majority group
+                    - a_index: Binary mask for group A (minority)
+                    - b_index: Binary mask for group B (majority)
+                    - mask_ratio_a: Proportion of group A items
+                    - mask_ratio_b: Proportion of group B items
             """
             fairness_info = {
                 'rho': [],
@@ -681,31 +929,94 @@ class GeneralModel(BaseModel):
 
         def actions_before_epoch(self) -> NoReturn:
             """
-            Actions to perform before each training epoch.
-            Note: Positive and negative sampling is now handled in _get_feed_dict method.
+            Execute pre-epoch preparations for GeneralModel.
+
+            Currently, positive and negative sampling is handled dynamically
+            in the _get_feed_dict method, so no special epoch-level actions
+            are required.
             """
             pass
 
 
 class SequentialModel(GeneralModel):
+    """
+    Sequential recommendation model incorporating user interaction history.
+
+    Extends GeneralModel to support sequence-aware recommendation by incorporating
+    user's historical interactions. This enables modeling of temporal patterns
+    and sequential dependencies in user behavior.
+
+    Key Features:
+    - User interaction history integration
+    - Configurable maximum history length
+    - Temporal sequence modeling support
+    - Position-aware data preparation
+    """
+
     @staticmethod
     def parse_model_args(parser):
+        """
+        Parse command-line arguments specific to sequential models.
+
+        Adds sequential model parameters to the base model arguments,
+        particularly the maximum history length for sequence modeling.
+
+        Args:
+            parser: ArgumentParser instance
+
+        Returns:
+            ArgumentParser: Updated parser with sequential model arguments
+        """
         parser.add_argument('--history_max', type=int, default=20,
                             help='Maximum length of history.')
         return GeneralModel.parse_model_args(parser)
 
     def __init__(self, args, corpus):
+        """
+        Initialize SequentialModel with history configuration.
+
+        Sets up sequential model parameters including maximum history length
+        and other sequence-specific configurations.
+
+        Args:
+            args: Configuration object including history_max parameter
+            corpus: Dataset corpus for sequential recommendation
+        """
         self.history_max = args.history_max
         super().__init__(args, corpus)
 
     class Dataset(GeneralModel.Dataset):
         def _prepare(self):
+            """
+            Prepare sequential dataset by filtering instances with valid history.
+
+            Removes instances where users have no interaction history (position == 0)
+            since sequential models require at least one previous interaction to
+            make meaningful predictions.
+            """
             idx_select = np.array(self.data['position']) > 0  # history length must be non-zero
             for key in self.data:
                 self.data[key] = np.array(self.data[key])[idx_select]
             super()._prepare()
 
         def _get_feed_dict(self, index):
+            """
+            Generate feed dictionary with user interaction history for sequential modeling.
+
+            Extends the base feed dictionary generation to include user's historical
+            interactions, enabling sequence-aware recommendation models to capture
+            temporal patterns and user preferences evolution.
+
+            Args:
+                index (int): Index of the data instance
+
+            Returns:
+                dict: Enhanced feed dictionary including:
+                    - All base features from parent class
+                    - history_items: User's interaction history
+                    - history_times: Timestamps of interactions
+                    - lengths: Length of actual history sequence
+            """
             feed_dict = super()._get_feed_dict(index)
             pos = self.data['position'][index]
             user_seq = self.corpus.user_his[feed_dict['user_id']][:pos]

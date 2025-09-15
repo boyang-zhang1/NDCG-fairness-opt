@@ -12,8 +12,35 @@ from utils import utils
 
 
 class BaseReader(object):
+    """
+    Base data reader class for recommendation systems with fairness considerations.
+
+    This class handles the loading, preprocessing, and organization of recommendation
+    datasets including user-item interactions and sensitive attribute information.
+    It supports various dataset formats and attribute types for fairness analysis.
+
+    Key Features:
+    - Multi-format dataset loading (CSV, DAT files)
+    - Sensitive attribute processing for fairness evaluation
+    - User interaction history management
+    - Train/dev/test data split handling
+    - Negative sampling preparation
+    """
+
     @staticmethod
     def parse_data_args(parser):
+        """
+        Parse command-line arguments for data loading and preprocessing.
+
+        Configures paths, dataset selection, file formats, and sensitive attribute
+        specifications for fairness-aware recommendation systems.
+
+        Args:
+            parser: ArgumentParser instance to add data-related arguments to
+
+        Returns:
+            ArgumentParser: Updated parser with data processing arguments
+        """
         parser.add_argument('--path', type=str, default='../data/',
                             help='Input data dir.')
         parser.add_argument('--dataset', type=str, default='ml-20m',
@@ -28,6 +55,16 @@ class BaseReader(object):
         return parser
 
     def __init__(self, args):
+        """
+        Initialize the BaseReader with dataset configuration parameters.
+
+        Sets up data loading parameters and initiates the data reading and
+        preprocessing pipeline including sensitive attribute processing.
+
+        Args:
+            args: Configuration object containing data paths, dataset name,
+                 file separators, sensitive attribute types, and other settings
+        """
         self.sep = args.sep
         self.prefix = args.path
         self.dataset = args.dataset
@@ -38,6 +75,23 @@ class BaseReader(object):
         self._append_his_info()
 
     def _read_data(self) -> NoReturn:
+        """
+        Load and preprocess dataset files including sensitive attributes.
+
+        This method performs comprehensive data loading:
+        - Loads attribute files (users.dat, movies.dat) with sensitive group information
+        - Processes sensitive attributes based on specified criteria:
+          * Movies: Genre-based sensitivity (e.g., Action, Crime)
+          * Users: Gender-based sensitivity
+          * Age: Age group-based sensitivity
+          * Movies_year: Release year-based sensitivity
+        - Loads train/dev/test interaction files
+        - Computes dataset statistics (users, items, interactions)
+        - Validates data consistency
+
+        The sensitive attribute processing creates binary labels indicating
+        membership in protected/sensitive groups for fairness evaluation.
+        """
         logging.info('Reading data from \"{}\", dataset = \"{}\" '.format(self.prefix, self.dataset))
         self.data_df = dict()
 
@@ -57,16 +111,6 @@ class BaseReader(object):
         elif self.attribute == 'age':
             for i in range(len(self.data_df['attribute']['age'])):
                 if str(self.data_df['attribute']['age'][i]) in self.sensitive_types:
-                    self.data_df['attribute'].loc[i, 'sensitive'] = True
-
-        elif self.attribute == 'occupation':
-            for i in range(len(self.data_df['attribute']['occupation'])):
-                if str(self.data_df['attribute']['occupation'][i]) in self.sensitive_types:
-                    self.data_df['attribute'].loc[i, 'sensitive'] = True
-
-        elif self.attribute == 'books':
-            for i in range(len(self.data_df['attribute']['genres'])):
-                if self.data_df['attribute']['genres'][i] == self.sensitive_types[0]:
                     self.data_df['attribute'].loc[i, 'sensitive'] = True
 
         elif self.attribute == 'movies_year':
@@ -101,9 +145,23 @@ class BaseReader(object):
 
     def _append_his_info(self) -> NoReturn:
         """
-        Add history info to data_df: position
-        ! Need data_df to be sorted by time in ascending order
-        disable time here!
+        Append user interaction history information to the dataset.
+
+        This method processes user interaction sequences to create:
+        - User interaction histories with positional information
+        - Training set interaction tracking (clicked items and ratings)
+        - Sequential position labels for temporal modeling
+        - User-specific item sets for negative sampling
+
+        Note: This implementation assumes data is sorted by time in ascending order.
+        Time information is currently disabled but position tracking is maintained
+        for sequential recommendation models.
+
+        The method creates several data structures:
+        - user_his: Complete interaction history per user
+        - train_clicked_set: Set of items each user interacted with (for negative sampling)
+        - train_clicked_list: Ordered list of user interactions
+        - train_ratings_list: Corresponding ratings for user interactions
         """
         logging.info('Appending history info...')
         self.user_his = dict()           # store the already seen sequence of each user

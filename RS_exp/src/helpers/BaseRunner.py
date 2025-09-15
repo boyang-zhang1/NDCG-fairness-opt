@@ -7,17 +7,11 @@ import logging
 import math
 import multiprocessing as mp
 import os
-import shutil
-import subprocess
-import tempfile
 from multiprocessing import Pool
 from time import time
 from typing import Dict, List, NoReturn, Tuple
 
 # Third-party imports
-import cvxpy as cp
-import fairsearchcore as fsc
-from fairsearchcore.models import FairScoreDoc
 import numpy as np
 from numpy import ndarray
 import pandas as pd
@@ -31,21 +25,23 @@ from models.BaseModel import BaseModel
 from utils import utils
 
 # Constants
-NUM_RERANKINGS = 100
 TOLERANCE_EPSILON = 1e-5
-CONVX_TOLERANCE = 1e-15
-SOLVER_ABS_TOL = 1e-10
-SOLVER_REL_TOL = 1e-10
 
 def sample_ranking(probability_matrix):
     """
-    Generate a ranking by sampling from probability matrix.
+    Generate a stochastic ranking by sampling from a probability matrix.
+
+    This function implements a position-wise sampling strategy where for each position
+    in the ranking, items are sampled according to their probabilities, and selected
+    items are removed from subsequent sampling rounds to ensure no duplicates.
 
     Args:
-        probability_matrix (np.ndarray): Probability matrix for ranking
+        probability_matrix (np.ndarray): 2D probability matrix of shape (n_positions, n_items)
+                                       where entry [i,j] represents the probability of
+                                       placing item j at position i
 
     Returns:
-        list: Sampled ranking indices
+        list: Sampled ranking indices representing the order of items
     """
     ranking = []
     remaining_indices = list(range(probability_matrix.shape[0]))
@@ -61,8 +57,34 @@ def sample_ranking(probability_matrix):
 
 
 class BaseRunner(object):
+    """
+    Base runner class for training and evaluating recommendation models with fairness considerations.
+
+    This class provides comprehensive functionality for:
+    - Training recommendation models with various optimization strategies
+    - Evaluating models using multiple ranking metrics (NDCG, MAP)
+    - Computing fairness metrics across sensitive groups
+    - Managing training processes with early stopping and model checkpointing
+    - Supporting various fairness-aware evaluation modes
+
+    The runner supports both accuracy-focused and fairness-aware model training,
+    with configurable evaluation strategies and baseline comparisons.
+    """
+
     @staticmethod
     def parse_runner_args(parser):
+        """
+        Parse command-line arguments for the recommendation system runner.
+
+        Configures training hyperparameters, evaluation settings, fairness metrics,
+        and system optimization parameters for the recommendation model.
+
+        Args:
+            parser: ArgumentParser instance to add arguments to
+
+        Returns:
+            ArgumentParser: Updated parser with all runner-specific arguments
+        """
         parser.add_argument('--epoch', type=int, default=120,
                             help='Number of epochs.')
         parser.add_argument('--check_epoch', type=int, default=1,
@@ -106,23 +128,31 @@ class BaseRunner(object):
         parser.add_argument('--model_modes', type=str, default='fn,f',
                             help='f=only fairness, n=only ndcg, fn=1/(1-fair)+1/ndcg.')
         parser.add_argument('--baseline', type=int, default=-1,
-                            help='print baseline test result, avaliable: 0: color blind, 1: Demographic Parity Constraints, 2: FA*IR, 3: Feldman et al.')
+                            help='print baseline test result, available: 0: color blind')
         parser.add_argument('--data_p', type=float, default=0.28,
                             help='the dataset sensitive group proportion')
         parser.add_argument('--threshold_k', type=int, default=5,
                             help='The number of threshold_k items during fair evaluation.')
+        parser.add_argument('--fairness_loss_type', type=str, default='mae',
+                            help='Type of fairness loss calculation: "mae" for Mean Absolute Error, "mse" for Mean Squared Error')
         return parser
 
     def _MAP_at_k(self, hit: np.ndarray, ground_truth_rank: np.ndarray) -> float:
         """
-        Calculate Mean Average Precision at k.
+        Calculate Mean Average Precision at k (MAP@k).
+
+        MAP@k measures the quality of ranked retrieval by computing the average
+        precision across all relevant items within the top-k positions. It considers
+        both the ranking order and the number of relevant items retrieved.
 
         Args:
-            hit (np.ndarray): Binary hit matrix
-            ground_truth_rank (np.ndarray): Ground truth ranking positions
+            hit (np.ndarray): Binary hit matrix of shape (n_users, k) indicating
+                            whether each top-k item is relevant (1) or not (0)
+            ground_truth_rank (np.ndarray): Ranking positions of ground truth items
+                                          of shape (n_users, n_relevant_items)
 
         Returns:
-            float: MAP@k score
+            float: Mean Average Precision at k across all users
         """
         ap_list = []
         hit_ground_truth_rank = (hit * ground_truth_rank).astype(float)
@@ -142,17 +172,26 @@ class BaseRunner(object):
     def _NDCG_at_k(ratings: np.ndarray, normalizer_mat: np.ndarray, hit: np.ndarray, ground_truth_rank: np.ndarray,
                    k: int) -> float:
         """
-        Calculate Normalized Discounted Cumulative Gain at k.
+        Calculate Normalized Discounted Cumulative Gain at k (NDCG@k).
+
+        NDCG@k is a ranking metric that measures the quality of a ranking by considering
+        both the relevance (rating) of items and their positions. Higher-rated items
+        at higher positions contribute more to the score, with logarithmic discounting
+        applied to lower positions.
 
         Args:
-            ratings (np.ndarray): Rating matrix
-            normalizer_mat (np.ndarray): Normalization matrix
-            hit (np.ndarray): Binary hit matrix
-            ground_truth_rank (np.ndarray): Ground truth ranking positions
-            k (int): Top-k value
+            ratings (np.ndarray): User-item rating matrix of shape (n_users, n_items)
+                                containing relevance scores for each user-item pair
+            normalizer_mat (np.ndarray): Ideal DCG normalization matrix of shape (n_users, k)
+                                       for computing normalized scores
+            hit (np.ndarray): Binary hit matrix of shape (n_users, k) indicating
+                            whether each top-k item is relevant
+            ground_truth_rank (np.ndarray): Ranking positions of items in the prediction
+                                          of shape (n_users, n_items)
+            k (int): Evaluation cutoff - only top-k positions are considered
 
         Returns:
-            float: NDCG@k score
+            float: Mean NDCG@k score across all users
         """
         # Calculate the normalizer first
         normalizer = np.sum(normalizer_mat[:, :k], axis=1)
@@ -166,17 +205,23 @@ class BaseRunner(object):
     def _NDCG_at_k_array(self, ratings: np.ndarray, normalizer_mat: np.ndarray, hit: np.ndarray, ground_truth_rank: np.ndarray,
                          k: int) -> float:
         """
-        Calculate NDCG at k for array of rankings.
+        Calculate NDCG@k for multiple ranking arrays (e.g., from stochastic reranking).
+
+        This method extends the standard NDCG@k calculation to handle multiple rankings
+        per user, typically generated through stochastic reranking procedures. It computes
+        the average NDCG@k across all ranking variants for each user.
 
         Args:
-            ratings (np.ndarray): Rating matrix
-            normalizer_mat (np.ndarray): Normalization matrix
-            hit (np.ndarray): Binary hit matrix
-            ground_truth_rank (np.ndarray): Ground truth ranking positions
-            k (int): Top-k value
+            ratings (np.ndarray): User-item rating matrix of shape (n_users, n_items)
+            normalizer_mat (np.ndarray): Ideal DCG normalization matrix
+            hit (np.ndarray): Binary hit matrix of shape (n_users, n_rerankings, k)
+                            indicating relevance across multiple rankings
+            ground_truth_rank (np.ndarray): Ranking positions across multiple rankings
+                                          of shape (n_users, n_rerankings, n_items)
+            k (int): Evaluation cutoff for top-k positions
 
         Returns:
-            float: NDCG@k score
+            float: Mean NDCG@k score averaged across users and ranking variants
         """
         # Repeat arrays along the new axis to match the dimensionality of ground_truth_rank
         ratings = np.repeat(ratings[:, np.newaxis, :], ground_truth_rank.shape[1], axis=1)
@@ -188,35 +233,53 @@ class BaseRunner(object):
         # Calculate DCG
         dcg = np.sum(((np.exp2(ratings) - 1) / np.log2(ground_truth_rank + 1)) * hit.astype(float), axis=2)
 
-        # Get the average DCG per user per NUM_RERANKINGS rerankings
+        # Get the average DCG per user per rerankings
         avg_dcg_per_user = np.mean(dcg / normalizer, axis=1)
 
         # Compute the mean across users
         return np.mean(avg_dcg_per_user, axis=0)
     
     @staticmethod
-    def fair_calculation(topk: list, sorted_indices: np.ndarray, item_ids: np.ndarray, attribute_array: np.ndarray, predictions: np.ndarray, threshold_k: int, fairness_metric: str = 'exp_avg'):
+    def fair_calculation(topk: list, sorted_indices: np.ndarray, item_ids: np.ndarray, attribute_array: np.ndarray, predictions: np.ndarray, threshold_k: int, fairness_metric: str = 'exp_avg', fairness_loss_type: str = 'mae'):
         """
-        Calculate fairness metrics for different top-k values.
+        Calculate comprehensive fairness metrics across different top-k cutoffs.
+
+        This method evaluates algorithmic fairness by measuring representation disparities
+        between sensitive groups (e.g., demographic groups) in recommendation rankings.
+        Multiple fairness metrics are supported, each capturing different aspects of
+        fair representation in ranked outputs.
 
         Args:
-            topk (list): List of top-k values to evaluate
-            sorted_indices (np.ndarray): Sorted item indices by predictions
-            item_ids (np.ndarray): Item ID array
-            attribute_array (np.ndarray): Binary attribute array (sensitive groups)
-            predictions (np.ndarray): Model predictions
-            threshold_k (int): Threshold k for certain fairness metrics
-            fairness_metric (str): Type of fairness metric to calculate
+            topk (list): List of top-k cutoff values to evaluate (e.g., [5, 10, 20])
+            sorted_indices (np.ndarray): Item indices sorted by prediction scores
+                                       of shape (n_users, n_items)
+            item_ids (np.ndarray): Mapping from indices to actual item IDs
+                                 of shape (n_users, n_items)
+            attribute_array (np.ndarray): Binary sensitive attribute array where 1 indicates
+                                        membership in protected group, shape (n_items,)
+            predictions (np.ndarray): Model prediction scores of shape (n_users, n_items)
+            threshold_k (int): Threshold cutoff for certain fairness metrics (e.g., sigmoid_thresh)
+            fairness_metric (str): Fairness evaluation method:
+                                 - 'exp_norm': Exponential normalization of predictions
+                                 - 'count': Simple group count differences
+                                 - 'sigmoid': Sigmoid-transformed predictions
+                                 - 'rank_topk': Average ranking positions
+                                 - 'ndcg_diff': NDCG-based group differences
+            fairness_loss_type (str): Type of fairness loss calculation:
+                                     - 'mae': Mean Absolute Error (default)
+                                     - 'mse': Mean Squared Error
 
         Returns:
-            tuple: (fairness_ratio_loss, fairness_loss) dictionaries
+            tuple: (fairness_ratio_loss, fairness_loss) where:
+                  - fairness_ratio_loss (dict): Ratio-based fairness metrics by top-k
+                  - fairness_loss (dict): Absolute difference fairness metrics by top-k
         """
         predictions = np.array(predictions)
         np.set_printoptions(threshold=10000)
         sorted_indices = np.array(sorted_indices)
         fairness_ratio_loss = dict()
-        fairness_loss = dict()  # MAE loss
-        fairness_loss = dict()  # MSE loss
+        fairness_mae_loss = dict()  # MAE loss
+        fairness_mse_loss = dict()  # MSE loss
         variance_group_loss = dict()
         avg_group_ratio = {}  # used for fa*ir
         epsilon = TOLERANCE_EPSILON
@@ -247,353 +310,54 @@ class BaseRunner(object):
                 fairness_ratio_loss[k] = np.average(group_a_norm / (group_b_norm + epsilon))
                 # MSE loss
                 fairness_mse_loss[k] = np.average((group_a_norm - group_b_norm) ** 2)
+                # MAE loss
+                fairness_mae_loss[k] = np.average(np.abs(group_a_norm - group_b_norm))
 
                 diff = group_a_norm - group_b_norm
                 num_top_bottom_elements = max(1, int(0.0002 * num_rows))  # 0.02% of the number of rows
 
                 # Get indices sorted by diff values
                 diff_sorted_indices = np.argsort(diff)
-                
-                # Calculate cross entropy loss for analysis (k == 305)
-                if k == 305:
-                    cross_entropy_loss = -np.sum(np.log(selected_predictions_norm + epsilon), axis=1)
-                    avg_cross_entropy = np.mean(cross_entropy_loss)
-
-            elif fairness_metric == 'exp_norm_topk':
-                exp_predictions = np.exp(predictions)
-                # Normalize these exponentiated values
-                exp_predictions_norm = exp_predictions / exp_predictions.sum(axis=1, keepdims=True)
-                # Assuming the ranked index remains the same, we sort and then take the top-k
-                selected_predictions_norm = np.take_along_axis(exp_predictions_norm, sorted_indices[:, :k], axis=1)
-                group_a_count = selected_attributes.sum(axis=1)
-                group_b_count = k - group_a_count
-                sum_temp = (selected_attributes * selected_predictions_norm).sum(axis=1)
-                group_a_count_temp = np.copy(group_a_count)
-                group_b_count_temp = np.copy(group_b_count)
-                group_a_count_temp[group_a_count_temp == 0] = 1
-                group_b_count_temp[group_b_count_temp == 0] = 1
-                group_a_norm_temp = sum_temp / group_a_count_temp
-                group_b_norm_temp = (1 - sum_temp) / group_b_count_temp
-                group_a_norm = np.where(group_a_count == 0, 0, group_a_norm_temp)
-                group_b_norm = np.where(group_b_count == 0, 0, group_b_norm_temp)
-                fairness_ratio_loss[k] = np.average(group_a_norm / (group_b_norm + epsilon))
-                fairness_loss[k] = np.average(np.abs(group_a_norm - group_b_norm))                
-
-            elif fairness_metric == 'rank_topk':
-                # Generate a 1D rank list for all users
-                rank_list = np.arange(1, k + 1)
-                rank_fallback = k + 1 
-
-                mask_group_a = selected_attributes == 1
-                mask_group_b = ~mask_group_a  # Assuming binary attributes, so directly using negation
-
-                sum_group_a = np.dot(mask_group_a, rank_list)
-                sum_group_b = np.dot(mask_group_b, rank_list)
-                count_group_a = np.sum(mask_group_a, axis=-1)
-                count_group_b = np.sum(mask_group_b, axis=-1)
-
-                avg_group_a = np.zeros(selected_attributes.shape[0])
-                avg_group_b = np.zeros(selected_attributes.shape[0])
-
-                # Only compute average where count is non-zero to avoid division by zero
-                non_zero_a = count_group_a != 0
-                non_zero_b = count_group_b != 0
-
-                avg_group_a[non_zero_a] = sum_group_a[non_zero_a] / count_group_a[non_zero_a]
-                avg_group_b[non_zero_b] = sum_group_b[non_zero_b] / count_group_b[non_zero_b]
-
-                # Apply fallback value where count is zero
-                avg_group_a[~non_zero_a] = rank_fallback
-                avg_group_b[~non_zero_b] = rank_fallback
-                fairness_ratio_loss[k] = np.average(avg_group_a / (avg_group_b + epsilon))
-                fairness_loss[k] = np.average(np.abs(avg_group_a - avg_group_b))
-            
-            elif fairness_metric == 'log_rank_topk':
-                # Generate a 1D rank list for all users
-                rank_list = 1 / np.log2(1 + np.arange(1, k + 1))
-                rank_fallback = 1 / np.log2(1 + k + 1)
-
-                mask_group_a = selected_attributes == 1
-                mask_group_b = ~mask_group_a  # Assuming binary attributes, so directly using negation
-
-                sum_group_a = np.dot(mask_group_a, rank_list)
-                sum_group_b = np.dot(mask_group_b, rank_list)
-                count_group_a = np.sum(mask_group_a, axis=-1)
-                count_group_b = np.sum(mask_group_b, axis=-1)
-
-                avg_group_a = np.zeros(selected_attributes.shape[0])
-                avg_group_b = np.zeros(selected_attributes.shape[0])
-
-                # Only compute average where count is non-zero to avoid division by zero
-                non_zero_a = count_group_a != 0
-                non_zero_b = count_group_b != 0
-
-                avg_group_a[non_zero_a] = sum_group_a[non_zero_a] / count_group_a[non_zero_a]
-                avg_group_b[non_zero_b] = sum_group_b[non_zero_b] / count_group_b[non_zero_b]
-
-                # Apply fallback value where count is zero
-                avg_group_a[~non_zero_a] = rank_fallback
-                avg_group_b[~non_zero_b] = rank_fallback
-                fairness_ratio_loss[k] = np.average(avg_group_a / (avg_group_b + epsilon))
-                fairness_loss[k] = np.average(np.abs(avg_group_a - avg_group_b))
-
-            elif fairness_metric == 'count':
-                group_a_count = selected_attributes.sum(axis=1)
-                group_b_count = k - group_a_count
-                fairness_ratio_loss[k] = np.average(group_a_count / (group_b_count + epsilon))
-                fairness_loss[k] = np.average(np.abs(group_a_count - group_b_count) / k)
-            
-            elif fairness_metric == 'sigmoid':
-                # Apply sigmoid function to predictions
-                selected_predictions = 1 / (1 + np.exp(-np.take_along_axis(predictions, sorted_indices[:, :k], axis=1)))
-                
-                # Calculate the sums for groups A and B
-                group_a_count = selected_attributes.sum(axis=1)
-                group_b_count = k - group_a_count
-                sum_group_a = (selected_attributes * selected_predictions).sum(axis=1)
-                sum_group_b = ((1 - selected_attributes) * selected_predictions).sum(axis=1)
-
-                # Calculate normalized values for groups A and B
-                group_a_count_temp = np.copy(group_a_count)
-                group_b_count_temp = np.copy(group_b_count)
-                group_a_count_temp[group_a_count_temp == 0] = 1
-                group_b_count_temp[group_b_count_temp == 0] = 1
-                group_a_norm = np.where(group_a_count == 0, 0, sum_group_a / group_a_count_temp)
-                group_b_norm = np.where(group_b_count == 0, 0, sum_group_b / group_b_count_temp)
-
-                # Calculate average differences
-                fairness_ratio_loss[k] = np.average(group_a_norm / (group_b_norm + epsilon))
-                fairness_loss[k] = np.average(np.abs(group_a_norm - group_b_norm))
-            
-            elif fairness_metric == 'sigmoid_thresh':
-                # Adjust predictions by subtracting the k-th score as a threshold
-                threshold = np.take_along_axis(predictions, sorted_indices[:, threshold_k-1:threshold_k], axis=1)
-                adjusted_predictions = np.take_along_axis(predictions, sorted_indices[:, :k], axis=1) - threshold
-
-                # Apply sigmoid function to the adjusted predictions
-                selected_predictions = 1 / (1 + np.exp(-adjusted_predictions))
-
-                # Calculate the sums for groups A and B
-                group_a_count = selected_attributes.sum(axis=1)
-                group_b_count = k - group_a_count
-                sum_group_a = (selected_attributes * selected_predictions).sum(axis=1)
-                sum_group_b = ((1 - selected_attributes) * selected_predictions).sum(axis=1)
-
-                # Calculate normalized values for groups A and B
-                group_a_count_temp = np.copy(group_a_count)
-                group_b_count_temp = np.copy(group_b_count)
-                group_a_count_temp[group_a_count_temp == 0] = 1
-                group_b_count_temp[group_b_count_temp == 0] = 1
-                group_a_norm = np.where(group_a_count == 0, 0, sum_group_a / group_a_count_temp)
-                group_b_norm = np.where(group_b_count == 0, 0, sum_group_b / group_b_count_temp)
-
-                # Calculate average differences
-                fairness_ratio_loss[k] = np.average(group_a_norm / (group_b_norm + epsilon))
-                fairness_loss[k] = np.average(np.abs(group_a_norm - group_b_norm))
-
-            elif fairness_metric == 'ndcg_diff':
-                # Extract sorted predictions and attributes for the top k items
-                sorted_predictions = np.take_along_axis(predictions, sorted_indices[:, :k], axis=1)
-                selected_attributes = np.take_along_axis(np_attribute[item_id - 1], sorted_indices[:, :k], axis=1)
-
-                # Calculate DCG for current sorting
-                log_positions = np.log2(np.arange(2, k + 2))
-                gt_a = selected_attributes.astype(float)  # Ground truth where G1 is on top
-                dcg_a = np.sum((np.power(2, gt_a) - 1) / log_positions, axis=1)
-                gt_b = (~selected_attributes).astype(float)  # Ground truth where G2 is on top
-                dcg_b = np.sum((np.power(2, gt_b) - 1) / log_positions, axis=1)
-
-                # Calculate IDCG for group A
-                ideal_sorted_a = np.sort(selected_attributes, axis=1)[:, ::-1]  # Sort group A items to the top
-                idcg_a = np.sum((np.power(2, ideal_sorted_a) - 1) / log_positions, axis=1)
-
-                # Calculate IDCG for group B
-                ideal_sorted_b = np.sort(~selected_attributes, axis=1)[:, ::-1]  # Sort group B items to the top
-                idcg_b = np.sum((np.power(2, ideal_sorted_b) - 1) / log_positions, axis=1)
-
-                # Avoid division by zero
-                idcg_a[idcg_a == 0] = 1
-                idcg_b[idcg_b == 0] = 1
-
-                # Calculate NDCG for groups A and B
-                ndcg_a_top = dcg_a / idcg_a
-                ndcg_b_top = dcg_b / idcg_b
-
-                fairness_ratio_loss[k] = np.average(ndcg_a_top / (ndcg_b_top + epsilon))
-                # MAE loss
-                # fairness_loss[k] = np.average(np.abs(ndcg_a_top - ndcg_b_top))
-                # MSE loss
-                fairness_mse_loss[k] = np.average((ndcg_a_top - ndcg_b_top) ** 2)
+        # Choose between MAE and MSE based on fairness_loss_type parameter
+        if fairness_loss_type.lower() == 'mse':
+            fairness_loss = fairness_mse_loss
+        else:  # default to MAE
+            fairness_loss = fairness_mae_loss
 
         logging.info(variance_group_loss)
         return fairness_ratio_loss, fairness_loss
-
-            
-
-    @staticmethod
-    def parallel_solve1(args):
-        """
-        Parallel optimization solver for demographic parity constraints.
-
-        Args:
-            args: Tuple containing user_idx, user_sorted_indices, predictions, item_id,
-                  np_attribute, sorted_indices, gt_rank
-
-        Returns:
-            tuple: (reranked_gt_rank, reranked_sorted_indices, avg_move, no_solution, equal_array)
-        """
-        user_idx, user_sorted_indices, predictions, item_id, np_attribute, sorted_indices, gt_rank = args
-        no_solution = 0
-        equal_array = 0
-        user_scores = predictions[user_idx, user_sorted_indices]
-        user_sensitive = np_attribute[np.take(item_id, user_sorted_indices) - 1]
-
-        # Calculate v for the current user
-        user_v = np.array([1.0 / (np.log(2 + i)) for i, _ in enumerate(user_scores)])
-
-        # Create and solve the optimization problem using the demographic parity constraint
-        P = cp.Variable((len(user_scores), len(user_scores)))
-        objective = cp.Maximize(cp.matmul(cp.matmul(user_scores, P), user_v))
-
-        constraints = [
-            cp.matmul(np.ones((1, len(user_scores))), P) == np.ones((1, len(user_scores))),
-            cp.matmul(P, np.ones((len(user_scores),))) == np.ones((len(user_scores),)),
-            0 <= P, P <= 1
-        ]
-
-        group1_indices = np.where(user_sensitive)[0]
-        group2_indices = np.where(user_sensitive == False)[0]
-
-        group1_weights = np.array([1 / user_scores[group1_indices].sum() if i in group1_indices else 0 for i in
-                                   range(len(user_scores))])
-        group2_weights = np.array([-1 / user_scores[group2_indices].sum() if i in group2_indices else 0 for i in
-                                   range(len(user_scores))])
-
-        demographic_parity_weights = group1_weights + group2_weights
-        tolerance = CONVX_TOLERANCE
-        constraint_demographic_parity1 = cp.matmul(cp.matmul(demographic_parity_weights, P), user_v) <= tolerance
-        constraint_demographic_parity2 = cp.matmul(cp.matmul(demographic_parity_weights, P), user_v) >= -tolerance
-        constraints.append(constraint_demographic_parity1)
-        constraints.append(constraint_demographic_parity2)
-
-        prob = cp.Problem(objective, constraints)
-        solver_options = {
-            'abstol': SOLVER_ABS_TOL,  # Absolute tolerance
-            'reltol': SOLVER_REL_TOL,  # Relative tolerance
-        }
-        reranked_gt_rank = np.zeros((NUM_RERANKINGS, len(gt_rank)), dtype=int)
-        reranked_sorted_indices = np.zeros((NUM_RERANKINGS, len(sorted_indices)), dtype=int)
-        try:
-            result = prob.solve(verbose=False, solver=cp.ECOS, **solver_options)
-            if P and P.value is not None:
-                P_value = np.clip(P.value, 0, 1)
-
-                # Rerank the user's items
-                new_ranking = np.zeros((NUM_RERANKINGS, len(sorted_indices)), dtype=int)
-
-                for i in range(NUM_RERANKINGS):
-                    new_ranking[i] = sample_ranking(P_value)
-
-                    # Rerank the user's items
-                for i in range(NUM_RERANKINGS):
-                    reranked_sorted_indices[i] = np.array([np.where(new_ranking[i] == x)[0][0] for x in sorted_indices])
-                    reranked_gt_rank[i] = np.array([np.where(new_ranking[i] == x - 1)[0][0] + 1 for x in gt_rank])
-            else:
-                no_solution = 1
-                for i in range(NUM_RERANKINGS):
-                    reranked_gt_rank[i] = gt_rank
-                    reranked_sorted_indices[i] = sorted_indices
-        except Exception as error:
-            logging.info("reranked_gt_rank error: " + str(error))
-            for i in range(NUM_RERANKINGS):
-                reranked_gt_rank[i] = gt_rank
-                reranked_sorted_indices[i] = sorted_indices
-        avg_move = np.average(np.average(np.abs(reranked_gt_rank - gt_rank)))
-        if np.array_equal(gt_rank, reranked_gt_rank[0]):
-            equal_array = 1
-        return reranked_gt_rank, reranked_sorted_indices, avg_move, no_solution, equal_array
-
-    @staticmethod
-    def parallel_solve2(args):
-        """
-        Parallel solver for FA*IR fairness algorithm.
-
-        Args:
-            args: Tuple containing k_value, p, alpha, unfair_rankings, gt_rank, sorted_indices,
-                  topk, item_id, np_attribute, num_pos_items, metrics, ratings, normalizer_mat,
-                  fairness_metric, predictions
-
-        Returns:
-            tuple: (tag, fairness_ratio_loss, fairness_loss, NDCG_results)
-        """
-        # create the Fair object for each combination of p and alpha
-        k_value, p, alpha, unfair_rankings, gt_rank, sorted_indices, topk, item_id, np_attribute, num_pos_items, metrics, ratings, normalizer_mat, fairness_metric, predictions = args
-        fair = fsc.Fair(k_value, p, alpha)
-        # print(k_value, p, alpha)
-        reranks = [fair.re_rank(sorted(unfair_ranking, key=lambda x: x.score, reverse=True)) for unfair_ranking in unfair_rankings]
-
-        reranked_idx = np.array([[item.id for item in sublist] for sublist in reranks])
-        repredictions = [[0 for _ in range(len(predictions[0]))] for _ in range(len(predictions))]
-        for i in range(len(predictions)):
-            for j in range(len(predictions[i])):
-                repredictions[i][reranked_idx[i][j]] = predictions[i][sorted_indices[i][j]]
-
-        fairness_ratio_loss, fairness_loss = BaseRunner.fair_calculation(topk, reranked_idx, item_id, np_attribute, repredictions, num_pos_items, fairness_metric)
-        reranked_gt_rank = np.array([[np.where(j == i)[0][0] + 1 for i in range(num_pos_items)] for j in reranked_idx])
-        NDCG_results = {}
-        for k in topk:
-            hit = (reranked_gt_rank <= k)
-            for metric in metrics:
-                key = '{}@{}'.format(metric, k)
-                if metric == 'NDCG':
-                    NDCG_results[key] = BaseRunner._NDCG_at_k(ratings, normalizer_mat, hit, reranked_gt_rank, k)
-        tag = [k_value, p, alpha]
-        logging.info(json.dumps({'tag': tag, 'fairness_ratio_loss': fairness_ratio_loss, 'fairness_loss': fairness_loss, 'NDCG_results': NDCG_results}))
-        return tag, fairness_ratio_loss, fairness_loss, NDCG_results
-
-    @staticmethod
-    def parallel_solve3(args):
-        """
-        Parallel solver for BlackBoxAuditing repair algorithm.
-
-        Args:
-            args: Tuple containing user_sorted_indices, predictions, item_id, np_attribute, ratio
-
-        Returns:
-            np.ndarray: Reranked indices
-        """
-        user_sorted_indices, predictions, item_id, np_attribute, ratio = args
-        tempdir = tempfile.mkdtemp()
-        input_filename = os.path.join(tempdir, "test.csv")
-        output_filename = os.path.join(tempdir, "repaired.csv")
-
-        user_scores = predictions[user_sorted_indices]
-        user_sensitive = np_attribute[np.take(item_id, user_sorted_indices) - 1]
-        # Sort and return the topN items
-        df = pd.DataFrame({'score': user_scores, 'sensitive': user_sensitive})
-        df.to_csv(input_filename, index=False)
-        subprocess.run(["BlackBoxAuditing-repair", input_filename, output_filename, str(ratio), "True", "-p", "sensitive"],
-                       check=True)
-        repaired_df = pd.read_csv(output_filename)
-        ranklist = repaired_df.sort_values(by='score', ascending=False).index.tolist()
-
-        reranked_idx = np.take(user_sorted_indices, ranklist)
-
-        shutil.rmtree(tempdir)
-        return reranked_idx
-
 
     def evaluate_method(self, predictions: np.ndarray, ratings: np.ndarray, topk: list, metrics: list,
                         item_id: np.ndarray, attribute=None) -> Tuple[
         Dict[str, float], Dict[int, float], Dict[int, float]]:
         """
-        :param predictions: (-1, n_candidates) shape, the first column is the score for ground-truth item
-        :param ratings: (# of users, # of pos items)
-        :param topk: top-K value list
-        :param metrics: metric string list
-        :param item_id: attribute list (pos + neg)
-        :param attribute: attribute info df
-        :return: a result dict, the keys are metric@topk
+        Comprehensive evaluation method for recommendation models with fairness analysis.
+
+        This method performs multi-faceted evaluation including:
+        - Standard ranking metrics (NDCG, MAP) at various cutoffs
+        - Fairness metrics across sensitive groups when attributes are provided
+        - Baseline comparisons for color-blind recommendation
+
+        The evaluation considers both recommendation quality and fairness, providing
+        insights into potential algorithmic bias in the ranking system.
+
+        Args:
+            predictions (np.ndarray): Model prediction scores of shape (n_users, n_candidates)
+                                    where first column contains ground-truth item scores
+            ratings (np.ndarray): User-item relevance ratings of shape (n_users, n_pos_items)
+            topk (list): List of top-k cutoff values for evaluation (e.g., [5, 10, 20])
+            metrics (list): List of evaluation metrics to compute (e.g., ['NDCG', 'MAP'])
+            item_id (np.ndarray): Item identifier array containing both positive and negative items
+                                of shape (n_users, n_candidates)
+            attribute (pd.DataFrame, optional): Item attribute information containing sensitive
+                                              group memberships. If provided, fairness analysis
+                                              is performed.
+
+        Returns:
+            tuple: Three-element tuple containing:
+                - evaluations (Dict[str, float]): Standard ranking metric results (e.g., 'NDCG@10')
+                - fairness_ratio_loss (Dict[int, float]): Fairness ratio metrics by top-k
+                - fairness_loss (Dict[int, float]): Fairness absolute difference metrics by top-k
         """
         evaluations = dict()
         rerank_evaluations = dict()
@@ -609,7 +373,7 @@ class BaseRunner(object):
         if attribute is not None:
             np_attribute = attribute['sensitive'].to_numpy()
             fairness_ratio_loss, fairness_loss = self.fair_calculation(topk, sorted_indices, item_id, np_attribute,
-                                                                          predictions, self.threshold_k, self.fairness_metric)
+                                                                          predictions, self.threshold_k, self.fairness_metric, self.fairness_loss_type)
             logging.info("Original: ")
             logging.info("fairness_ratio_loss_dic: " + str(fairness_ratio_loss))
             logging.info("fairness_loss_dic: " + str(fairness_loss))
@@ -626,115 +390,19 @@ class BaseRunner(object):
                     raise ValueError('Undefined evaluation metric: {}.'.format(metric))
 
         logging.info("Original evaluations: " + str(evaluations))
-
-        if self.baseline == 1:
-            args = [(user_idx, user_sorted_indices, predictions, item_id[user_idx], np_attribute, sorted_indices[user_idx],
-                     gt_rank[user_idx]) for user_idx, user_sorted_indices in enumerate(sorted_indices)]
-
-            with Pool() as p:
-                results = p.map(BaseRunner.parallel_solve1, args)
-            reranked_gt_rank, reranked_sorted_indices, avg_move, no_solution, equal_array = zip(*results)
-            reranked_gt_rank = np.array(reranked_gt_rank)
-            reranked_sorted_indices = np.array(reranked_sorted_indices)
-            avg_move = np.array(avg_move)
-            no_solution = np.array(no_solution)
-            equal_array = np.array(equal_array)
-            fairness_ratio_loss_arr = np.zeros((NUM_RERANKINGS, len(topk)))
-            fairness_loss_arr = np.zeros((NUM_RERANKINGS, len(topk)))
-            for i in range(reranked_sorted_indices.shape[1]):
-                each_reranked_sorted_indices = reranked_sorted_indices[:, i, :]
-                repredictions = [[0 for _ in range(len(predictions[0]))] for _ in range(len(predictions))]
-                for ii in range(len(predictions)):
-                    for j in range(len(predictions[ii])):
-                        repredictions[ii][each_reranked_sorted_indices[ii][j]] = predictions[ii][sorted_indices[ii][j]]
-                fairness_ratio_loss, fairness_loss = self.fair_calculation(topk, each_reranked_sorted_indices,
-                                                                        item_id, np_attribute, repredictions,
-                                                                        self.threshold_k, self.fairness_metric)
-                fairness_ratio_loss_arr[i] = [fairness_ratio_loss[key] for key in topk]
-                fairness_loss_arr[i] = [fairness_loss[key] for key in topk]
-            fairness_ratio_loss_arr = np.mean(fairness_ratio_loss_arr, axis=0)
-            fairness_ratio_loss_dic = {key: value for key, value in zip(topk, fairness_ratio_loss_arr)}
-            fairness_loss_arr = np.mean(fairness_loss_arr, axis=0)
-            fairness_loss_dic = {key: value for key, value in zip(topk, fairness_loss_arr)}
-            logging.info("Baseline1: ")
-            logging.info("fairness_ratio_loss_dic: " + str(fairness_ratio_loss_dic))
-            logging.info("fairness_loss_dic: " + str(fairness_loss_dic))
-            logging.info("avg_move: " + str(np.average(avg_move)))
-            logging.info("equal_array: " + str(np.average(equal_array)))
-            logging.info("no_solution: " + str(np.average(no_solution)))
-
-            for k in topk:
-                hit = (reranked_gt_rank <= k)
-                for metric in metrics:
-                    key = '{}@{}'.format(metric, k)
-                    if metric == 'NDCG':
-                        rerank_evaluations[key] = self._NDCG_at_k_array(ratings, normalizer_mat, hit,
-                                                                        reranked_gt_rank, k)
-                    # elif metric == 'MAP':
-                    #     rerank_evaluations[key] = self._MAP_at_k(hit, reranked_gt_rank[:20])
-                    else:
-                        raise ValueError('Undefined evaluation metric: {}.'.format(metric))
-            logging.info("baseline1 evaluations: " + str(rerank_evaluations))
-
-        if self.baseline == 2:
-            k_value = len(sorted_indices[0])  # number of topK elements returned (value should be between 10 and 400)
-            p_min = max(self.data_p - 0.1, 0)
-            p_max = min(self.data_p + 0.1, 1)
-            p_values = np.arange(p_min, p_max + 0.001, 0.1)  # create array of p values from 0.02 to 0.98 with step size 0.01
-            alpha_values = np.arange(0.01, 0.15,
-                                     0.065)  # create array of alpha values from 0.01 to 0.15 with step size 0.01
-            unfair_rankings = []
-            for i in range(len(predictions)):
-                unfair_ranking = []
-                u_attribute = np_attribute[item_id[i] - 1]
-                for j in range(len(predictions[0])):
-                    unfair_ranking.append(FairScoreDoc(j, predictions[i][j], u_attribute[j]))
-                unfair_rankings.append(unfair_ranking)
-
-            args = [(k_value, p, alpha, unfair_rankings, gt_rank, sorted_indices, topk, item_id, np_attribute, num_pos_items, metrics, ratings,
-                     normalizer_mat, self.fairness_metric, predictions) for p in p_values for alpha in alpha_values]
-
-            with Pool() as p:
-                results = p.map(BaseRunner.parallel_solve2, args)
-            # args = (k_value, 0.2, 0.1, unfair_rankings, gt_rank, sorted_indices, topk, item_id, np_attribute, num_pos_items, metrics, ratings, normalizer_mat)
-            # results = BaseRunner.parallel_solve2(args)
-            tag, fairness_ratio_loss, fairness_loss, NDCG_results = zip(*results)
-            tag = np.array(tag)
-            fairness_ratio_loss = np.array(fairness_ratio_loss)
-            fairness_loss = np.array(fairness_loss)
-            # NDCG_results = np.array(NDCG_results)
-            # for i in range(len(tag)):
-            #     print(tag[i], fairness_ratio_loss[i], fairness_loss[i], NDCG_results[i])
-
-        if self.baseline == 3:
-            ratios = np.arange(0.1, 1, 0.4)
-            for ratio in ratios:
-                args = [(sorted_indices[i], predictions[i], item_id[i], np_attribute, ratio) for i in range(len(predictions))]
-                # args = [(sorted_indices[i], predictions[i], item_id[i], np_attribute, ratio) for i in range(10)]
-                with Pool() as p:
-                    results = p.map(BaseRunner.parallel_solve3, args)
-                reranked_idx = np.array(results)
-                repredictions = [[0 for _ in range(len(predictions[0]))] for _ in range(len(predictions))]
-                for i in range(len(predictions)):
-                    for j in range(len(predictions[i])):
-                        repredictions[i][reranked_idx[i][j]] = predictions[i][sorted_indices[i][j]]
-                fairness_ratio_loss, fairness_loss = BaseRunner.fair_calculation(topk, reranked_idx, item_id, np_attribute,
-                                                                              repredictions, self.threshold_k, self.fairness_metric)
-                NDCG_results = {}
-                reranked_gt_rank = np.zeros((len(gt_rank), len(gt_rank[0])), dtype=int)
-                for i in range(len(gt_rank)):
-                    reranked_gt_rank[i] = np.array([np.where(reranked_idx[i] == x)[0][0] + 1 for x in np.take(sorted_indices[i], gt_rank[i] - 1)])
-                for k in topk:
-                    hit = (reranked_gt_rank <= k)
-                    for metric in metrics:
-                        key = '{}@{}'.format(metric, k)
-                        if metric == 'NDCG':
-                            NDCG_results[key] = BaseRunner._NDCG_at_k(ratings, normalizer_mat, hit, reranked_gt_rank, k)
-                logging.info(json.dumps({'ratio': ratio, 'fairness_ratio_loss': fairness_ratio_loss, 'fairness_loss': fairness_loss,
-                                         'NDCG_results': NDCG_results}))
         return evaluations, fairness_ratio_loss, fairness_loss
 
     def __init__(self, args):
+        """
+        Initialize the BaseRunner with configuration parameters.
+
+        Sets up all training, evaluation, and fairness-related parameters based on
+        command-line arguments or configuration objects.
+
+        Args:
+            args: Configuration object containing all necessary parameters for
+                 training, evaluation, and fairness assessment
+        """
         self.epoch = args.epoch
         self.check_epoch = args.check_epoch
         self.test_epoch = args.test_epoch
@@ -761,8 +429,19 @@ class BaseRunner(object):
         self.baseline = args.baseline
         self.data_p = args.data_p
         self.threshold_k = args.threshold_k
+        self.fairness_loss_type = args.fairness_loss_type
 
     def _adjust_lr(self, optimizer, epoch):
+        """
+        Adjust learning rate according to the predefined schedule.
+
+        Implements step-wise learning rate decay based on epoch milestones.
+        When an epoch reaches a milestone, the learning rate is reduced by a factor of 4.
+
+        Args:
+            optimizer: PyTorch optimizer whose learning rate will be adjusted
+            epoch (int): Current training epoch number
+        """
         lr = self.learning_rate
         for milestone in self.schedule:
             lr *= 0.25 if epoch >= milestone else 1
@@ -770,6 +449,19 @@ class BaseRunner(object):
             param_group['lr'] = lr
 
     def _check_time(self, start=False):
+        """
+        Track and measure training time intervals.
+
+        Provides timing functionality for monitoring training progress and
+        measuring time elapsed between checkpoints.
+
+        Args:
+            start (bool): If True, initializes timing. If False, returns elapsed time
+                        since last check.
+
+        Returns:
+            float: Elapsed time in seconds since last check, or start time if start=True
+        """
         if self.time is None or start:
             self.time = [time()] * 2
             return self.time[0]
@@ -778,15 +470,64 @@ class BaseRunner(object):
         return self.time[1] - tmp_time
 
     def _build_optimizer(self, model):
+        """
+        Construct and configure the optimization algorithm.
+
+        Creates a PyTorch optimizer instance based on the specified optimizer type,
+        learning rate, and weight decay parameters. Supports various optimization
+        algorithms including Adam, SGD, Adagrad, and Adadelta.
+
+        Args:
+            model: PyTorch model whose parameters will be optimized
+
+        Returns:
+            torch.optim.Optimizer: Configured optimizer instance
+        """
         logging.info('Optimizer: ' + self.optimizer_name)
         optimizer = eval('torch.optim.{}'.format(self.optimizer_name))(
             model.customize_parameters(), lr=self.learning_rate, weight_decay=self.l2)
         return optimizer
 
     def _fairness_ndcg_calculator(self, norm_fairness, ndcg):
+        """
+        Calculate combined fairness-utility metric.
+
+        Computes a harmonic-like combination of fairness and NDCG metrics,
+        balancing recommendation quality with fairness considerations.
+
+        Args:
+            norm_fairness (float): Normalized fairness score (0 = perfectly fair)
+            ndcg (float): Normalized Discounted Cumulative Gain score
+
+        Returns:
+            float: Combined fairness-utility score
+        """
         return (1 - norm_fairness) * ndcg / (1 - norm_fairness + ndcg)
 
     def train(self, data_dict: Dict[str, BaseModel.Dataset], attribute: pd.DataFrame) -> NoReturn:
+        """
+        Execute the complete model training process with fairness monitoring.
+
+        Manages the full training lifecycle including:
+        - Model fitting across multiple epochs
+        - Performance evaluation on development set
+        - Fairness metric computation and tracking
+        - Early stopping based on accuracy and fairness criteria
+        - Model checkpointing and saving
+        - Learning rate scheduling
+
+        The training process balances multiple objectives: recommendation accuracy,
+        fairness across sensitive groups, and computational efficiency.
+
+        Args:
+            data_dict (Dict[str, BaseModel.Dataset]): Dictionary containing training,
+                                                    development, and test datasets
+            attribute (pd.DataFrame): Item attribute information for fairness evaluation
+                                    containing sensitive group memberships
+
+        Returns:
+            NoReturn: This method manages the training process but does not return values
+        """
         model = data_dict['train'].model
         main_metric_results, fairness_results = list(), list()
         dev_fairness_results = {key: [] for key in self.topk}
@@ -892,8 +633,19 @@ class BaseRunner(object):
 
     def _add_ids(self, batch: dict, out_dict: dict) -> dict:
         """
-            extract user ids and item ids from a batch
-            and add them into out_dict
+        Extract and transfer batch metadata to output dictionary.
+
+        Transfers essential batch information including user IDs, item IDs, ratings,
+        and fairness-related metadata from input batch to the model output dictionary.
+        This ensures that downstream evaluation can properly associate predictions
+        with their corresponding users, items, and fairness attributes.
+
+        Args:
+            batch (dict): Input batch containing user/item data and metadata
+            out_dict (dict): Model output dictionary to be augmented with batch metadata
+
+        Returns:
+            dict: Enhanced output dictionary containing both model outputs and batch metadata
         """
         out_dict['user_id'] = batch['user_id'].clone()
         out_dict['item_id'] = batch['item_id'].clone()
@@ -909,6 +661,20 @@ class BaseRunner(object):
         return out_dict
 
     def fit(self, data: BaseModel.Dataset, epoch=-1) -> float:
+        """
+        Perform one epoch of model training.
+
+        Executes a complete training epoch including forward pass, loss computation,
+        backpropagation, and parameter updates. Supports gradient clipping and
+        learning rate adjustment.
+
+        Args:
+            data (BaseModel.Dataset): Training dataset
+            epoch (int): Current epoch number (-1 for no epoch-specific behavior)
+
+        Returns:
+            float: Average training loss for the epoch
+        """
         model = data.model
         if model.optimizer is None:
             model.optimizer = self._build_optimizer(model)
@@ -939,6 +705,21 @@ class BaseRunner(object):
         return np.mean(loss_lst).item()
 
     def eval_termination(self, criterion: List[float], fairness_results: List[float] = []) -> bool:
+        """
+        Determine whether to terminate training based on early stopping criteria.
+
+        Evaluates multiple termination conditions:
+        - Sustained non-improvement in primary metric
+        - Distance from best performance exceeding threshold
+        - Combined accuracy and fairness stagnation
+
+        Args:
+            criterion (List[float]): History of primary evaluation metric (e.g., NDCG)
+            fairness_results (List[float]): History of fairness metric values
+
+        Returns:
+            bool: True if training should be terminated, False otherwise
+        """
         if not fairness_results:
             if len(criterion) > self.early_stop_thresh and utils.non_increasing(criterion[-self.early_stop:]):
                 return True
@@ -956,8 +737,19 @@ class BaseRunner(object):
     def evaluate(self, data: BaseModel.Dataset, topks: list, metrics: list, attribute=None) -> Tuple[
         Dict[str, float], Dict[int, int], Dict[int, float]]:
         """
-        Evaluate the results for an input dataset.
-        :return: result dict (key: metric@k)
+        Evaluate model performance on a given dataset.
+
+        Performs comprehensive evaluation including ranking metrics and fairness analysis.
+        This method coordinates prediction generation and metric computation.
+
+        Args:
+            data (BaseModel.Dataset): Dataset to evaluate on
+            topks (list): List of top-k cutoffs for evaluation
+            metrics (list): List of ranking metrics to compute
+            attribute (pd.DataFrame, optional): Attribute data for fairness evaluation
+
+        Returns:
+            tuple: (ranking_metrics, fairness_ratios, fairness_losses)
         """
         predictions, ratings = self.predict(data)
         return self.evaluate_method(predictions, ratings, topks, metrics,
@@ -965,10 +757,24 @@ class BaseRunner(object):
 
     def predict(self, data: BaseModel.Dataset) -> Tuple[ndarray, ndarray]:
         """
-        The returned prediction is a 2D-array, each row corresponds to all the candidates,
-        and the ground-truth item poses the first.
-        Example: ground-truth items: [1, 2], 2 negative items for each instance: [[3,4], [5,6]]
-                 predictions like: [[1,3,4], [2,5,6]]
+        Generate model predictions for a dataset.
+
+        Performs inference on the given dataset, producing prediction scores for
+        all user-item pairs. The prediction format places ground-truth items first
+        followed by negative samples for each user.
+
+        Example:
+            Ground-truth items: [1, 2]
+            Negative items: [[3,4], [5,6]]
+            Predictions: [[pred_1, pred_3, pred_4], [pred_2, pred_5, pred_6]]
+
+        Args:
+            data (BaseModel.Dataset): Dataset to generate predictions for
+
+        Returns:
+            tuple: (predictions, ratings) where:
+                - predictions (ndarray): Shape (n_users, n_items) prediction scores
+                - ratings (ndarray): Shape (n_users, n_pos_items) ground truth ratings
         """
         data.model.eval()
         predictions = list()
@@ -983,8 +789,17 @@ class BaseRunner(object):
 
     def print_res(self, data: BaseModel.Dataset, attribute=None) -> str:
         """
-        Construct the final result string before/after training
-        :return: test result string
+        Generate formatted result string for model evaluation.
+
+        Creates a human-readable summary of model performance metrics
+        for reporting and logging purposes.
+
+        Args:
+            data (BaseModel.Dataset): Dataset to evaluate on
+            attribute (pd.DataFrame, optional): Attribute data for fairness metrics
+
+        Returns:
+            str: Formatted string containing evaluation results
         """
         accuracy_dict, _, _ = self.evaluate(data, self.topk, self.metrics, attribute)
         res_str = '(' + utils.format_metric(accuracy_dict) + ')'

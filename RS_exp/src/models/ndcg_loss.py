@@ -660,9 +660,6 @@ class NDCGLoss(nn.Module):
                     num_positive_items * torch.mean(main_loss_terms, dim=-1) / ideal_dcg
                 ).mean()
 
-
-
-
                 # Calculate fairness loss based on fairness type
                 if self.use_simple_fairness:
                     fairness_loss = torch.mean(
@@ -712,7 +709,7 @@ class NDCGLoss(nn.Module):
 
                         loss_g2 = torch.mean(loss_user, dim=-1)
 
-                    elif self.fair_type == 'exp_top1_fair':
+                    elif self.fair_type == 'exp_top1_fair': # SO-RED in the paper
                         a_index = batch['a_index'].to(device)
                         b_index = batch['b_index'].to(device)
 
@@ -741,7 +738,7 @@ class NDCGLoss(nn.Module):
 
                         loss_g2 = torch.mean(a_avg * grad_f3_1 + b_avg * grad_f3_2 + d_avg * grad_f3_3, dim=-1)
 
-                    elif self.fair_type == 'exp_top1_fair_topk':
+                    elif self.fair_type == 'exp_top1_fair_topk': # KSO-RED in the paper
                         # If preds_lambda_diffs > 0, then temp = 1, else 0
                         # temp1 = (preds_lambda_diffs > 0).float()
                         temp_sigmoid = torch.sigmoid(preds_lambda_diffs * self.sigmoid_beta)
@@ -779,205 +776,6 @@ class NDCGLoss(nn.Module):
                             grad_f3_3 = (grad_f3_constant * (-u_a + u_b) * self.v1 / slate_length / (u_d ** 2)).clone().detach_()
 
                         loss_g2 = torch.mean(a_avg_sigmoid * grad_f3_1 + b_avg_sigmoid * grad_f3_2 + d_avg * grad_f3_3, dim=-1)
-
-                    elif self.fair_type == 'rank_fair':
-                        a_index = batch['a_index'].to(device)
-                        b_index = batch['b_index'].to(device)
-
-                        batch_size, slate_length = predictions.size()
-
-                        predictions_expand_fair = einops.repeat(predictions, 'b n -> (b copy) n',
-                                           copy=slate_length)  # [batch_size*slate_length, slate_length]
-                        predictions_fair = einops.rearrange(predictions, 'b n -> (b n) 1')  # [batch_size*slate_length, 1]
-                        # print("predictions_expand_fair[0]", predictions_expand_fair[0])
-                        # print("predictions_fair[0]", predictions_fair[0])
-
-                        g_rank = torch.mean(self._squared_hinge_loss(predictions_expand_fair - predictions_fair, self.sqh_c),
-                                    dim=-1)  # [batch_size*slate_length]
-                        g_rank = g_rank.reshape(batch_size, slate_length)  # [batch_size, slate_length], line 5 in Algo 2.
-                        # print("g_rank[0]", g_rank[0])
-
-                        a_g_map = a_index * g_rank # [batch_size, slate_length]
-                        b_g_map = b_index * g_rank
-                        a_g_avg = a_g_map.sum(dim=1) / (torch.sum(a_index, dim=1) + self.eps) / slate_length # [batch_size]
-                        b_g_avg = b_g_map.sum(dim=1) / (torch.sum(b_index, dim=1) + self.eps) / slate_length
-
-                        self.u_a[user_ids] = (1 - self.gamma2) * self.u_a[user_ids] + self.gamma2 * a_g_avg.cpu()
-                        self.u_b[user_ids] = (1 - self.gamma3) * self.u_b[user_ids] + self.gamma3 * b_g_avg.cpu()
-
-                        u_a = self.u_a[user_ids].to(device)
-                        u_b = self.u_b[user_ids].to(device)
-
-                        grad_f3_constant = self.fairness_c * (u_a - u_b) * slate_length 
-                        grad_f3_1 = grad_f3_constant.detach_()
-                        grad_f3_2 = -grad_f3_constant.detach_()
-
-                        loss_g2 = torch.mean(a_g_avg * grad_f3_1 + b_g_avg * grad_f3_2, dim=-1)
-                        # print("loss_g2", loss_g2)
-
-
-                    elif self.fair_type == 'rank_fair_topk':
-                        temp_sigmoid = torch.sigmoid(preds_lambda_diffs * self.sigmoid_beta)
-                        a_index = batch['a_index'].to(device)
-                        b_index = batch['b_index'].to(device)
-
-                        batch_size, slate_length = predictions.size()
-
-                        predictions_expand_fair = einops.repeat(predictions, 'b n -> (b copy) n',
-                                           copy=slate_length)  # [batch_size*slate_length, slate_length]
-                        predictions_fair = einops.rearrange(predictions[:, :], 'b n -> (b n) 1')  # [batch_size*slate_length, 1]
-
-                        g_rank = torch.mean(self._squared_hinge_loss(predictions_expand_fair - predictions_fair, self.sqh_c),
-                                    dim=-1)  # [batch_size*slate_length]
-                        g_rank = g_rank.reshape(batch_size, slate_length)  # [batch_size, slate_length], line 5 in Algo 2.
-
-                        a_g_map = a_index * g_rank * temp_sigmoid # [batch_size, num_pos + num_neg]
-                        b_g_map = b_index * g_rank * temp_sigmoid
-                        a_g_avg = a_g_map.sum(dim=1) / (torch.sum(a_index, dim=1) + self.eps) / slate_length # [batch_size]
-                        b_g_avg = b_g_map.sum(dim=1) / (torch.sum(b_index, dim=1) + self.eps) / slate_length                                             
-
-                        self.u_a[user_ids] = (1 - self.gamma2) * self.u_a[user_ids] + self.gamma2 * a_g_avg.cpu()
-                        self.u_b[user_ids] = (1 - self.gamma3) * self.u_b[user_ids] + self.gamma3 * b_g_avg.cpu()
-
-                        u_a = self.u_a[user_ids].to(device)
-                        u_b = self.u_b[user_ids].to(device)
-
-                        grad_f3_constant = self.fairness_c * (u_a - u_b) * slate_length 
-                        grad_f3_1 = grad_f3_constant.detach_()
-                        grad_f3_2 = -grad_f3_constant.detach_()
-
-                        loss_g2 = torch.mean(a_g_avg * grad_f3_1 + b_g_avg * grad_f3_2, dim=-1)
-
-                    elif self.fair_type == 'log_rank_fair1':
-                        a_index = batch['a_index'].to(device)
-                        b_index = batch['b_index'].to(device)
-
-                        batch_size, slate_length = predictions.size()
-
-                        predictions_expand_fair = einops.repeat(predictions, 'b n -> (b copy) n',
-                                           copy=slate_length)  # [batch_size*slate_length, slate_length]
-                        predictions_fair = einops.rearrange(predictions, 'b n -> (b n) 1')  # [batch_size*slate_length, 1]
-                        # print("predictions_expand_fair[0]", predictions_expand_fair[0])
-                        # print("predictions_fair[0]", predictions_fair[0])
-
-                        g_rank = 1 / (torch.log2(1 + torch.mean(self._squared_hinge_loss(predictions_expand_fair - predictions_fair, self.sqh_c), dim=-1)))  # [batch_size*slate_length]
-                        g_rank = g_rank.reshape(batch_size, slate_length)  # [batch_size, slate_length], line 5 in Algo 2.
-                        # print("g_rank[0]", g_rank[0])
-
-                        a_g_map = a_index * g_rank # [batch_size, slate_length]
-                        b_g_map = b_index * g_rank
-                        a_g_avg = a_g_map.sum(dim=1) / (torch.sum(a_index, dim=1) + self.eps) / slate_length # [batch_size]
-                        b_g_avg = b_g_map.sum(dim=1) / (torch.sum(b_index, dim=1) + self.eps) / slate_length
-
-                        self.u_a[user_ids] = (1 - self.gamma2) * self.u_a[user_ids] + self.gamma2 * a_g_avg.cpu()
-                        self.u_b[user_ids] = (1 - self.gamma3) * self.u_b[user_ids] + self.gamma3 * b_g_avg.cpu()
-
-                        u_a = self.u_a[user_ids].to(device)
-                        u_b = self.u_b[user_ids].to(device)
-
-                        grad_f3_constant = self.fairness_c * (u_a - u_b) * slate_length 
-                        grad_f3_1 = grad_f3_constant.detach_()
-                        grad_f3_2 = -grad_f3_constant.detach_()
-
-                        loss_g2 = torch.mean(a_g_avg * grad_f3_1 + b_g_avg * grad_f3_2, dim=-1)
-                        # print("loss_g2", loss_g2)
-                    
-                    elif self.fair_type == 'log_rank_fair2':
-                        a_index = batch['a_index'].to(device)
-                        b_index = batch['b_index'].to(device)
-
-                        batch_size, slate_length = predictions.size()
-
-                        predictions_expand_fair = einops.repeat(predictions, 'b n -> (b copy) n',
-                                           copy=slate_length)  # [batch_size*slate_length, slate_length]
-                        predictions_flat = einops.rearrange(predictions, 'b n -> (b n) 1')  # [batch_size*slate_length, 1]
-                        # print("predictions_expand_fair[0]", predictions_expand_fair[0])
-                        # print("predictions_fair[0]", predictions_fair[0])
-
-                        g_rank = torch.mean(self._squared_hinge_loss(predictions_expand_fair - predictions_flat, self.sqh_c), dim=-1)  # [batch_size*slate_length]
-                        g_rank = g_rank.reshape(batch_size, slate_length)  # [batch_size, slate_length], line 5 in Algo 2.
-                        # print("g_rank[0]", g_rank[0])
-
-                        # user_ids = batch['user_id'].cpu()
-                        user_ids_repeat = einops.repeat(user_ids, 'n -> (n copy)', copy=slate_length)
-
-                        item_ids = batch['item_id'].cpu()  # [batch_size, slate_length]
-                        item_ids = einops.rearrange(item_ids, 'b n -> (b n)')
-
-                        self.ui[user_ids_repeat, item_ids] = (1 - self.gamma0) * self.ui[
-                            user_ids_repeat, item_ids] + self.gamma0 * g_rank.clone().detach_().reshape(-1).cpu()
-                        
-                        g_ui = self.ui[user_ids_repeat, item_ids].reshape(batch_size, slate_length).to(device)
-
-                        nabla_f_g_fair = self.item_num / ((torch.log2(1 + self.item_num * g_ui)) ** 2 * (1 + self.item_num * g_ui) * np.log(2)) 
-
-                        a_index_num = torch.sum(a_index, dim=-1) + self.eps
-                        b_index_num = torch.sum(b_index, dim=-1) + self.eps
-
-                        temp_u1 = (a_index / torch.log2(1 + self.item_num * g_ui)).sum(dim=-1) / a_index_num
-                        temp_u2 = (b_index / torch.log2(1 + self.item_num * g_ui)).sum(dim=-1) / b_index_num
-                        temp_u1_u2 = temp_u1 - temp_u2
-
-                        loss_user = (a_index * nabla_f_g_fair * g_rank).sum(dim=-1) / a_index_num - (b_index * nabla_f_g_fair * g_rank).sum(dim=-1) / b_index_num
-
-                        loss_g2 = torch.mean(self.fairness_c * temp_u1_u2 * loss_user, dim=-1)
-
-                    elif self.fair_type == 'log_rank_fair3':
-                        a_index = batch['a_index'].to(device)
-                        b_index = batch['b_index'].to(device)
-
-                        batch_size, slate_length = predictions.size()
-
-                        predictions_expand_fair = einops.repeat(predictions, 'b n -> (b copy) n',
-                                           copy=slate_length)  # [batch_size*slate_length, slate_length]
-                        predictions_flat = einops.rearrange(predictions, 'b n -> (b n) 1')  # [batch_size*slate_length, 1]
-                        # print("predictions_expand_fair[0]", predictions_expand_fair[0])
-                        # print("predictions_fair[0]", predictions_fair[0])
-
-                        g_rank = torch.mean(self._squared_hinge_loss(predictions_expand_fair - predictions_flat, self.sqh_c), dim=-1)  # [batch_size*slate_length]
-                        g_rank = g_rank.reshape(batch_size, slate_length)  # [batch_size, slate_length], line 5 in Algo 2.
-                        # print("g_rank[0]", g_rank[0])
-
-                        # user_ids = batch['user_id'].cpu()
-                        user_ids_repeat = einops.repeat(user_ids, 'n -> (n copy)', copy=slate_length)
-
-                        item_ids = batch['item_id'].cpu()  # [batch_size, slate_length]
-                        item_ids = einops.rearrange(item_ids, 'b n -> (b n)')
-
-                        self.ui[user_ids_repeat, item_ids] = (1 - self.gamma0) * self.ui[
-                            user_ids_repeat, item_ids] + self.gamma0 * g_rank.clone().detach_().reshape(-1).cpu()
-                        
-                        g_ui = self.ui[user_ids_repeat, item_ids].reshape(batch_size, slate_length).to(device)
-
-                        
-                        # a_g_map = a_index * g_rank # [batch_size, slate_length]
-                        # b_g_map = b_index * g_rank
-
-                        # a_g_map_log = a_index * 1/ torch.log2(1 + g_ui.clone.detach_()) # [batch_size, slate_length]
-                        a_g_map_log = a_index * 1/ torch.log2(1 + g_ui)
-                        b_g_map_log = b_index * 1/ torch.log2(1 + g_ui)
-
-
-                        a_g_avg_log = a_g_map_log.sum(dim=1) / (torch.sum(a_index, dim=1) + self.eps) / slate_length # [batch_size]
-                        b_g_avg_log = b_g_map_log.sum(dim=1) / (torch.sum(b_index, dim=1) + self.eps) / slate_length
-
-                        #self.u_a[user_ids] = torch.log2(1 + g_rank.clone().detach_().reshape(-1).cpu()), dim=-1) *amap
-
-                        self.u_a[user_ids] = (1 - self.gamma2) * self.u_a[user_ids] + self.gamma2 * a_g_avg_log.cpu()
-                        self.u_b[user_ids] = (1 - self.gamma3) * self.u_b[user_ids] + self.gamma3 * b_g_avg_log.cpu()
-                        temp_u_a = self.u_a[user_ids].to(device)
-                        temp_u_b = self.u_b[user_ids].to(device)
-
-                        nabla_f_g_fair = -self.item_num / ((torch.log2(1 + self.item_num * g_ui)) ** 2 * (1 + self.item_num * g_ui) * np.log(2)) 
-
-                        a_index_num = torch.sum(a_index, dim=-1) + self.eps
-                        b_index_num = torch.sum(b_index, dim=-1) + self.eps
-
-                        temp_u1_u2 = temp_u_a - temp_u_b
-
-                        loss_user = (a_index * nabla_f_g_fair * g_rank).sum(dim=-1) / a_index_num - (b_index * nabla_f_g_fair * g_rank).sum(dim=-1) / b_index_num
-
-                        loss_g2 = torch.mean(self.fairness_c * temp_u1_u2 * loss_user, dim=-1)
                     
 
                 self._debug_print("Main loss and fairness loss", (main_loss.item(), fairness_loss.item()))
