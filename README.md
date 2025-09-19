@@ -4,55 +4,18 @@
 [![PyTorch](https://img.shields.io/badge/PyTorch-1.4+-ee4c2c?logo=pytorch&logoColor=white)](https://pytorch.org/)
 [![CUDA](https://img.shields.io/badge/CUDA-10.2+-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 
-This repository contains the implementation of fairness-aware learning-to-rank algorithms that jointly optimize ranking quality (NDCG) and group fairness in top-K positions. The framework extends state-of-the-art NDCG optimization techniques with novel fairness constraints to address bias in recommendation and ranking systems.
-
-
-## Key Contributions
-
-### 1. Fairness-Aware Loss Functions
-We implement several novel fairness-aware ranking losses that extend classical ranking objectives:
-
-- **Simple Fairness Loss**: A foundational fairness penalty that measures exposure disparity between groups using softmax-normalized predictions
-- **ListNet Fair Loss**: Extends ListNet with group fairness constraints, balancing cross-entropy ranking loss with fairness penalties
-- **ListMLE Fair Loss**: Incorporates fairness into the ListMLE framework for probabilistic ranking
-- **BPR Fair Loss**: Augments Bayesian Personalized Ranking with fairness regularization
-- **Listwise Cross-Entropy Fair Loss**: Combines listwise cross-entropy with moving average fairness estimation
-- **NDCG Fair Loss**: Our main contribution - integrates fairness directly into NDCG optimization with multiple variants:
-  - `exp_top1_fair`: Exponential fairness with top-1 probability
-  - `exp_topk`: Top-K constrained exponential fairness
-  - `rank_fair`: Position-based fairness using ranking utilities
-  - `log_rank_fair`: Logarithmic discounting for position-based fairness
-
-### 2. Advanced Optimization Techniques
-
-- **Stochastic Gradient Estimation**: Uses exponential moving averages (γ parameters) to estimate fairness gradients efficiently
-- **Top-K Threshold Learning**: Adaptive threshold optimization for constraining fairness to top-K positions using learnable thresholds
-- **Bidirectional Fairness**: Option to penalize both over and under-representation (`use_balanced_fairness` mode)
-- **Multi-scale Fairness**: Different fairness types operating at various granularities (item-level, rank-level, score-level)
-- **Second-order Optimization**: Hessian approximation for improved convergence in theoretical top-K version
-
-### 3. Comprehensive Evaluation Framework
-
-- **Fairness Metrics**:
-  - `exp_norm`: Exponential normalization-based fairness (default)
-  - `sigmoid_thresh`: Sigmoid with top-K threshold
-  - `ndcg_diff`: NDCG difference between groups
-  - `rank_topk`: Average rank disparity in top-K
-  - `log_rank_topk`: Logarithmic rank disparity
-
+Implementation of learning-to-rank algorithms that optimize both ranking quality (NDCG) and fairness in top-K positions.
 
 ## Installation
 
 ### Requirements
 - Python 3.7+ (tested with 3.7.11)
 - PyTorch 1.4+ (tested with 1.4.0)
-- CUDA 10.2+ (optional, for GPU acceleration)
-- NumPy 1.21+
-- Pandas 1.3+
-- scikit-learn 1.0+
-- einops 0.4+
+- CUDA 10.2+ (optional)
+- NumPy 1.21
+- Pandas 1.3
 
-### Setup
+### Quick Setup
 ```bash
 git clone https://github.com/boyang-zhang1/NDCG-fairness-opt.git
 cd NDCG-fairness-opt
@@ -62,28 +25,47 @@ conda env create -f ndcg_env.yml
 conda activate pytorch14
 ```
 
-## Quick Start
+## Running Different Methods
+
+The framework implements several methods mentioned in the paper. Navigate to `RS_exp/src` and use the following commands:
 
 ```bash
-# Navigate to the source directory
-cd RS_exp/src
+# KSO-RED: Our main contribution - top-K fairness optimization
+python main.py --dataset nf-20m --sensitive_types 1990 --attribute movies_year --ndcg_topk 300 --fair_type exp_top1_fair_topk --fairness_c 10000
 
-# Run with default settings (NDCG loss with fairness)
-python main.py --dataset ml-20m --model NeuMF --loss_type NDCG --fairness_c 0
+# SO-RED: Stochastic optimization for ranking exposure disparity (baseline version)
+python main.py --dataset nf-20m --sensitive_types 1990 --attribute movies_year --ndcg_topk 300 --fairness_c 10000
 
-# Run with different fairness types
-python main.py --dataset ml-20m --model NeuMF --loss_type NDCG --fair_type exp_top1_fair --fairness_c 10000
+# NG-DE: Integration of NDCG ranking loss and disparate exposure
+python main.py --dataset nf-20m --sensitive_types 1990 --attribute movies_year --ndcg_topk 300 --simple_fair --fairness_c 10000
+
+# DELTR: ListNet-based fair ranking baseline
+python main.py --dataset nf-20m --sensitive_types 1990 --attribute movies_year --fairness_c 10000
+
+# K-SONG: Color-blind ranking (no fairness constraints)
+python main.py --dataset nf-20m --sensitive_types 1990 --attribute movies_year --ndcg_topk 300 --fairness_c 0
 ```
+
+### Method Descriptions:
+- **KSO-RED**: Our proposed top-K fairness optimization algorithm
+- **SO-RED**: Exposure disparity optimization without top-K constraints
+- **NG-DE**: Baseline combining NDCG and disparate exposure
+- **DELTR**: ListNet-based fairness-aware ranking
+- **K-SONG**: Standard ranking without fairness considerations
 
 ## Dataset Preparation
 
-The framework supports multiple datasets with sensitive attributes:
+The framework supports recommendation datasets with sensitive group attributes for fairness evaluation:
 
 ### Supported Datasets
-- **MovieLens-20M (ml-20m)**:
-  - Sensitive attributes: Movie genres (Action, Crime, etc.) or User demographics (Gender, Age)
-- **Netflix Prize**:
-  - Sensitive attributes: Movie year, genres
+- **MovieLens-20M**: Comprises 20 million ratings from 138,000 users across 27,000 movies
+- **Netflix Prize**: Random subset of 20 million ratings for 17,770 movies from the original dataset
+
+### Derived Sensitive Group Datasets
+To evaluate fairness between protected and non-protected groups, we derive three subsets:
+- **MovieLens-20M-H**: horror vs. non-horror movies
+- **MovieLens-20M-D**: documentary vs. non-documentary movies
+- **Netflix-20M**: movies before 1990 vs. from 1990 onwards
 
 ### Data Format
 ```
@@ -128,7 +110,11 @@ NDCG-fairness-opt/
 
 ## Evaluation
 
-The framework provides comprehensive evaluation metrics:
+The framework evaluates both ranking accuracy and fairness:
+
+### Evaluation Metrics
+- **Accuracy**: NDCG (Normalized Discounted Cumulative Gain) at top-K positions
+- **Fairness**: Top-K exposure disparity measured as Mean Absolute Error (MAE) and Mean Squared Error (MSE) of the difference between averaged exposures of minority and majority groups
 
 ### Running Evaluation
 ```bash
@@ -137,14 +123,13 @@ python main.py --dataset ml-20m --model NeuMF --load_model path/to/model.pth --t
 ```
 
 ### Key Parameters
-- `--fairness_c`: Fairness weight
-- `--fair_type`: Fairness type (`exp_top1_fair`, `rank_fair`, etc.)
-- `--ndcg_topk`: Top-K positions (-1=all items)
-- `--balance_fair`: Bidirectional fairness
-- `--simple_fair`: Simplified fairness
+- `--fairness_c`: Fairness weight parameter C that balances ranking quality and fairness (C=0 for color-blind ranking)
+- `--ndcg_topk`: Top-K positions for evaluation
 
 ## Acknowledgments
 
 This work builds upon:
-- [NDCG Optimization](https://arxiv.org/abs/2202.12183): Original NDCG optimization framework
+- K-SONG framework for stochastic optimization of NDCG surrogates
+- Equal exposure fairness definitions from prior learning-to-rank literature
+- Bilevel finite-sum coupled compositional optimization techniques
 
